@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+jobs:
+  rust:
+    name: Rust CI
+    uses: muvon/ci-workflow/.github/workflows/rust-ci.yml@master
+    with:
+      feature-flags: '--all-features'
+      doc: false
+      coverage: false
+
+  musl-build:
+    name: Musl Build (x86_64 + aarch64)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build in Alpine (mirrors release pipeline)
+      run: |
+        docker run --rm \
+          -v "$(pwd):/workspace" \
+          -w /workspace \
+          rust:1.95.0-alpine3.23 \
+          sh -c "
+            apk add --no-cache git perl musl-dev pkgconfig gcc g++ && \
+            rustup target add ${{ matrix.target }} && \
+            cargo build --target ${{ matrix.target }}
+          "
+
+  brief:
+    uses: muvon/ci-workflow/.github/workflows/brief.yml@master
+    secrets: inherit

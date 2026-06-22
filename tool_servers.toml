@@ -1,0 +1,26 @@
+[[servers]]
+name = "jina-mcp"
+transport = "http"
+url = "https://mcp.jina.ai/v1"
+
+[[servers.headers]]
+name = "Authorization"
+value = "Bearer ${JINA_API_KEY}"
+
+[servers.override]
+allow = ["search_web", "read_url"]
+
+[servers.override.rename]
+search_web = "natural_language_search"
+read_url = "url_exact_search"
+
+[servers.override.redescripte]
+search_web = "搜索网络信息"
+read_url = "精确匹配并读取指定 URL 的内容"
+
+# octofs — 文件系统操作
+[[servers]]
+name = "octofs"
+transport = "stdio"
+command = "./tools/octofs/bin/octofs.exe"
+args = ["mcp"]

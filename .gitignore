@@ -1,0 +1,7 @@
+/target
+.env
+agent.log
+nul
+*.exe
+agent_data/
+
