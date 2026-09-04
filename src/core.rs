@@ -206,9 +206,29 @@ impl Sessions {
     }
 
     /// Replace the transcript (capped) and persist the session.
+    /// Replace the transcript (capped, tool outputs truncated) and persist it.
+    /// Truncation keeps history from bloating the next request: multi-KB tool
+    /// dumps otherwise accumulate and degrade the model within a few turns.
     pub fn save_transcript(&self, id: &str, mut transcript: Vec<ChatCompletionRequestMessage>) {
+        use async_openai::types::chat::{
+            ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+        };
+        const MAX_STORED_TOOL_CHARS: usize = 4000;
         if transcript.len() > MAX_TRANSCRIPT {
             transcript.drain(..transcript.len() - MAX_TRANSCRIPT);
+        }
+        for message in &mut transcript {
+            if let ChatCompletionRequestMessage::Tool(tool) = message
+                && let ChatCompletionRequestToolMessageContent::Text(text) = &mut tool.content
+                && text.len() > MAX_STORED_TOOL_CHARS
+            {
+                let mut end = MAX_STORED_TOOL_CHARS;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str("…（历史截断）");
+            }
         }
         let stored = self.lock().get_mut(id).map(|s| {
             s.transcript = transcript.clone();

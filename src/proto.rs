@@ -546,6 +546,11 @@ async fn run_chat_loop(
             TurnResult::ToolCalls { assistant, calls, usage } => {
                 turn_usage.add(usage);
                 transcript.push(assistant);
+                // Every requested call MUST get a result message, even when
+                // the turn dies halfway: an assistant tool_calls block without
+                // matching tool messages is malformed history and confuses
+                // (or gets rejected by) the next request.
+                let mut answered = 0usize;
                 let mut stopped = false;
                 for call in &calls {
                     let mut ctx = crate::tools::CallCtx {
@@ -578,6 +583,14 @@ async fn run_chat_loop(
                         break;
                     }
                     transcript.push(Llm::tool_result(&call.id, output));
+                    answered += 1;
+                }
+                for call in calls.iter().skip(answered) {
+                    transcript.push(Llm::tool_result(
+                        &call.id,
+                        "(previous tool call was cancelled before producing a result)"
+                            .to_string(),
+                    ));
                 }
                 if stopped {
                     return (StopReason::Cancelled, turn_usage);
