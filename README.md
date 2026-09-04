@@ -41,9 +41,10 @@ prompt. Threads reopen from history via `session/resume`.
 
 - initialize (+ `agent`-type `api-key` auth method), session/new/load-guard,
   prompt (spawned turns), cancel (interrupts streams, kills children),
-  close, resume (AgDb-backed), set_mode, authenticate
-- streamed replies, permission-gated tools (allow-once/always/reject),
-  per-session cwd, per-session MCP stdio servers, audit log
+  close, resume + load (AgDb-backed, history replay), set_mode, authenticate
+- streamed replies with per-turn token usage (`usage_update`)
+- permission-gated tools (allow-once/always/reject) with rich reports:
+  inline content, file locations, raw I/O, and real diffs for writes
 - safety: cwd confinement, sensitive-path refusal, destructive-command
   screen — but **not a sandbox**: the process runs as your user, the
   permission dialog is the real gate

@@ -448,3 +448,36 @@ async fn phase1_write_reports_diff() {
     );
     assert!(Peer::agent_text(&notifs).contains("done"));
 }
+
+#[tokio::test]
+async fn phase1_thought_chunks_stream() {
+    let _live = LIVE.lock().await;
+    let mut peer = Peer::spawn().await;
+    let session = new_session(&mut peer).await;
+
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+        "params":{"sessionId": session, "prompt": [{
+            "type": "text",
+            "text": "Why is the sky blue? Think step by step, then answer briefly."
+        }]}}))
+        .await;
+    let mut thought = String::new();
+    let stop = loop {
+        let frame = peer.next_frame().await;
+        if frame.get("id") == Some(&json!(id)) {
+            assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
+            break frame["result"]["stopReason"].clone();
+        }
+        if frame.get("method") == Some(&json!("session/update"))
+            && frame["params"]["update"].get("sessionUpdate")
+                == Some(&json!("agent_thought_chunk"))
+            && let Some(t) = frame["params"]["update"]["content"]["text"].as_str()
+        {
+            thought.push_str(t);
+        }
+    };
+    assert_eq!(stop, json!("end_turn"));
+    assert!(!thought.is_empty(), "expected thought chunks");
+}

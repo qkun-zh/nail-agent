@@ -141,11 +141,9 @@ pub struct PendingToolCall {
     pub arguments: String,
 }
 
-/// Outcome of a single model turn (no looping here; the caller loops).
-/// Token usage accumulated from one streaming turn.
+/// Outcome of a single model turn (no looping here; the caller loops)./// Token usage accumulated from one streaming turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
-    pub input: u64,
+pub struct Usage {    pub input: u64,
     pub output: u64,
 }
 
@@ -174,6 +172,42 @@ pub enum TurnResult {
     },
     Cancelled,
     Error(String),
+}
+
+/// Minimal SSE chunk shape (`byot`): the stock async-openai delta type has
+/// no `reasoning_content` field, so provider thinking would be silently
+/// dropped. Unknown fields are ignored, keeping this robust across vendors.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<StreamUsage>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// Chain-of-thought text (Qwen/DashScope style). Absent on OpenAI.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<async_openai::types::chat::ChatCompletionMessageToolCallChunk>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StreamUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Clone)]
@@ -210,7 +244,8 @@ impl Llm {
     }
 
     /// Run one streaming turn over `messages`, offering `tools`.
-    /// Each text delta goes to `on_text`; a `false` return stops early.
+    /// Text deltas go to `on_text`, thinking deltas to `on_thought`;
+    /// a `false` return stops the turn early.
     pub async fn chat_once(
         &self,
         model: &str,
@@ -218,6 +253,7 @@ impl Llm {
         tools: Vec<ChatCompletionTools>,
         cancel: &mut watch::Receiver<bool>,
         mut on_text: impl AsyncFnMut(&str) -> bool,
+        mut on_thought: impl AsyncFnMut(&str) -> bool,
     ) -> TurnResult {
         let mut args = CreateChatCompletionRequestArgs::default();
         args.model(model).messages(messages).stream(true).stream_options(
@@ -233,7 +269,15 @@ impl Llm {
             Ok(request) => request,
             Err(err) => return TurnResult::Error(format!("构造模型请求失败：{err}")),
         };
-        let mut stream = match self.client.chat().create_stream(request).await {
+        let mut stream = match self
+            .client
+            .chat()
+            .create_stream_byot::<
+                async_openai::types::chat::CreateChatCompletionRequest,
+                StreamChunk,
+            >(request)
+            .await
+        {
             Ok(stream) => stream,
             Err(err) => return TurnResult::Error(format!("请求模型失败：{err}")),
         };
@@ -255,17 +299,24 @@ impl Llm {
                         Err(err) => return TurnResult::Error(format!("读取流失败：{err}")),
                     };
                     if let Some(report) = chunk.usage {
-                        usage.input += u64::from(report.prompt_tokens);
-                        usage.output += u64::from(report.completion_tokens);
+                        usage.input += report.prompt_tokens;
+                        usage.output += report.completion_tokens;
                     }
                     for choice in chunk.choices {
-                        if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+                        let delta = choice.delta;
+                        if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
                             full_content.push_str(&text);
                             if !on_text(&text).await {
                                 return TurnResult::Cancelled;
                             }
                         }
-                        if let Some(deltas) = choice.delta.tool_calls {
+                        if let Some(thought) =
+                            delta.reasoning_content.filter(|t| !t.is_empty())
+                            && !on_thought(&thought).await
+                        {
+                            return TurnResult::Cancelled;
+                        }
+                        if let Some(deltas) = delta.tool_calls {
                             for delta in deltas {
                                 let index = delta.index as usize;
                                 while tool_ids.len() <= index {

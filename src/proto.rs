@@ -426,6 +426,11 @@ async fn run_chat_loop(
         let cx_owned = cx.clone();
         let session_owned = session_id.clone();
         let mut cancel_stream = cancel.clone();
+        // Thought chunks stream alongside the answer; they are display-only
+        // and never enter the transcript (OpenAI convention).
+        let thought_cx = cx.clone();
+        let thought_session = session_id.clone();
+        let mut thought_cancel = cancel.clone();
         match llm
             .chat_once(
                 model,
@@ -437,6 +442,10 @@ async fn run_chat_loop(
                         reply.push_str(delta);
                     }
                     stream_text(&cx_owned, &session_owned, &mut cancel_stream, delta).await
+                },
+                async move |thought| {
+                    stream_thought(&thought_cx, &thought_session, &mut thought_cancel, thought)
+                        .await
                 },
             )
             .await
@@ -506,8 +515,27 @@ async fn run_chat_loop(
     }
 }
 
-fn text_chunk(session_id: &SessionId, text: &str) -> SessionNotification {
-    SessionNotification::new(
+/// Stream one thinking chunk (display-only, like Zed's native agent).
+/// Returns `false` when cancelled or the transport broke.
+async fn stream_thought(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    cancel: &mut watch::Receiver<bool>,
+    text: &str,
+) -> bool {
+    if *cancel.borrow_and_update() {
+        return false;
+    }
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new(text),
+        ))),
+    ))
+    .is_ok()
+}
+
+fn text_chunk(session_id: &SessionId, text: &str) -> SessionNotification {    SessionNotification::new(
         session_id.clone(),
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
             TextContent::new(text),
