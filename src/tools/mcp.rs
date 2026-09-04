@@ -407,7 +407,30 @@ pub async fn execute_mcp(
         Err(_) => return done(format!("工具参数不是合法 JSON（{namespaced}）：{arguments}")),
     };
     let tool_id = format!("mcp-{namespaced}");
-    let title = format!("{server}: {tool}");
+    // Title carries the salient argument so the card shows WHAT ran, not
+    // just which tool: `octofs: shell \`echo hi\`` instead of `octofs: shell`.
+    let detail = args
+        .get("command")
+        .or_else(|| args.get("path"))
+        .or_else(|| args.get("paths"))
+        .map(|v| {
+            let s = v.to_string();
+            let s = s.trim_matches('"');
+            if s.len() > 80 {
+                let mut end = 80;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &s[..end])
+            } else {
+                s.to_string()
+            }
+        })
+        .filter(|s| !s.is_empty());
+    let title = match detail {
+        Some(detail) => format!("{server}: {tool} `{detail}`"),
+        None => format!("{server}: {tool}"),
+    };
     // Defense in depth: our own screens still apply to MCP calls, including
     // the embedded octofs shell (octofs scopes itself with --path on top).
     if tool == "shell"        && let Some(args_obj) = args.as_object()

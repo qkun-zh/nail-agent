@@ -14,6 +14,9 @@ struct Peer {
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
     next_id: i64,
     _child: tokio::process::Child,
+    /// When true, `terminal/wait_for_exit` is left unanswered (the turn stays
+    /// busy) so the cancel-mid-run test can strike deterministically.
+    hold_wait_exit: bool,
 }
 
 impl Peer {
@@ -54,6 +57,38 @@ impl Peer {
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             _child: child,
+            hold_wait_exit: false,
+        }
+    }
+
+    /// Answer agent-to-client capability requests (fs + terminal).
+    /// Returns true when the frame was handled (caller must `continue`).
+    async fn answer_client_caps(&mut self, frame: &Value) -> bool {
+        let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let result: Option<Value> = match method {
+            "fs/read_text_file" => Some(json!({"content": "harness-file-content\n"})),
+            "fs/write_text_file" => Some(json!({})),
+            "terminal/create" => Some(json!({"terminalId": "term-1"})),
+            "terminal/wait_for_exit" => {
+                if self.hold_wait_exit {
+                    return true; // leave busy for the cancel test
+                }
+                Some(json!({"exitStatus": {"exitCode": 0, "signal": Value::Null}}))
+            }
+            "terminal/output" => Some(json!({
+                "output": "harness-terminal-output\n",
+                "truncated": false,
+                "exitStatus": {"exitCode": 0, "signal": Value::Null},
+            })),
+            "terminal/kill" | "terminal/release" => Some(json!({})),
+            _ => None,
+        };
+        if let Some(result) = result {
+            self.send(&json!({"jsonrpc":"2.0","id":frame["id"],"result":result}))
+                .await;
+            true
+        } else {
+            false
         }
     }
 
@@ -80,6 +115,9 @@ impl Peer {
         let mut notifs = Vec::new();
         loop {
             let frame = self.next_frame().await;
+            if self.answer_client_caps(&frame).await {
+                continue;
+            }
             if frame.get("id") == Some(&json!(id)) {
                 assert!(
                     frame.get("error").is_none(),
@@ -237,12 +275,15 @@ async fn phase1_model_calls_tool_by_itself() {
     peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
         "params":{"sessionId": session, "prompt": [{
             "type": "text",
-            "text": "You MUST call the run tool with command `echo final-tool-ok`, then reply with the command output and nothing else."
+            "text": "You MUST call the run tool with command `echo anything`, then reply with the command output and nothing else."
         }]}}))
         .await;
     let mut notifs = Vec::new();
     let stop = loop {
         let frame = peer.next_frame().await;
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
         if frame.get("id") == Some(&json!(id)) {
             assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
             break frame["result"]["stopReason"].clone();
@@ -280,7 +321,10 @@ async fn phase1_model_calls_tool_by_itself() {
         }),
         "expected a usage_update with used > 0"
     );
-    assert!(Peer::agent_text(&notifs).contains("final-tool-ok"));
+    // The fake client terminal answers with canned output; the model must
+    // have gone through the tool and reported it back (substring: models
+    // occasionally paraphrase instead of quoting verbatim).
+    assert!(Peer::agent_text(&notifs).contains("harness"));
 }
 
 #[tokio::test]
@@ -315,6 +359,9 @@ async fn phase1_mcp_stdio_tool() {
     let mut notifs = Vec::new();
     let stop = loop {
         let frame = peer.next_frame().await;
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
         if frame.get("id") == Some(&json!(id)) {
             assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
             break frame["result"]["stopReason"].clone();
@@ -428,6 +475,9 @@ async fn phase1_write_reports_diff() {
     let mut notifs = Vec::new();
     let stop = loop {
         let frame = peer.next_frame().await;
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
         if frame.get("id") == Some(&json!(id)) {
             assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
             break frame["result"]["stopReason"].clone();
@@ -478,6 +528,9 @@ async fn phase1_thought_chunks_stream() {
     let mut thought = String::new();
     let stop = loop {
         let frame = peer.next_frame().await;
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
         if frame.get("id") == Some(&json!(id)) {
             assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
             break frame["result"]["stopReason"].clone();
@@ -518,6 +571,9 @@ async fn phase1_octofs_embedded() {
     let mut notifs = Vec::new();
     let stop = loop {
         let frame = peer.next_frame().await;
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
         if frame.get("id") == Some(&json!(id)) {
             assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
             break frame["result"]["stopReason"].clone();
@@ -562,4 +618,59 @@ async fn phase1_idle_cancel_does_not_poison_next_turn() {
     let (result, text) = prompt(&mut peer, &session, "Reply with exactly: ok").await;
     assert_eq!(result["stopReason"], json!("end_turn"));
     assert!(text.contains("ok"), "turn was poisoned by idle cancel: {text}");
+}
+
+/// Cancelling while the turn waits on a client terminal must end the turn
+/// as Cancelled (and kill + release the terminal). The harness holds the
+/// wait_for_exit reply so the turn stays busy deterministically.
+#[tokio::test]
+async fn phase1_cancel_mid_terminal() {
+    let _live = LIVE.lock().await;
+    let mut peer = Peer::spawn().await;
+    peer.hold_wait_exit = true;
+    let session = new_session(&mut peer).await;
+
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+        "params":{"sessionId": session, "prompt": [{
+            "type": "text",
+            "text": "You MUST call the run tool with command `sleep 30`, then reply done."
+        }]}}))
+        .await;
+    let mut saw_kill = false;
+    let mut saw_release = false;
+    let stop = loop {
+        let frame = peer.next_frame().await;
+        if frame.get("method") == Some(&json!("terminal/kill")) {
+            saw_kill = true;
+        }
+        if frame.get("method") == Some(&json!("terminal/release")) {
+            saw_release = true;
+        }
+        if peer.answer_client_caps(&frame).await {
+            continue;
+        }
+        if frame.get("id") == Some(&json!(id)) {
+            break frame["result"]["stopReason"].clone();
+        }
+        if frame.get("method") == Some(&json!("session/request_permission")) {
+            let req_id = frame["id"].clone();
+            peer.send(&json!({"jsonrpc":"2.0","id":req_id,
+                "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}))
+                .await;
+            // Strike while the turn is parked in terminal/wait_for_exit.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            peer.notify("session/cancel", json!({"sessionId": session})).await;
+            continue;
+        }
+        if frame.get("method") == Some(&json!("terminal/kill")) {
+            saw_kill = true;
+        }
+        if frame.get("method") == Some(&json!("terminal/release")) {
+            saw_release = true;
+        }
+    };
+    assert_eq!(stop, json!("cancelled"));
+    assert!(saw_kill && saw_release, "terminal not cleaned up");
 }

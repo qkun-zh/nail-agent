@@ -16,10 +16,11 @@
 pub mod mcp;
 
 use agent_client_protocol::schema::v1::{
-    Diff, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    CreateTerminalRequest, Diff, KillTerminalRequest, PermissionOption, PermissionOptionKind,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionId, SessionNotification, SessionUpdate, Terminal, TerminalId, TerminalOutputRequest,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use async_openai::types::chat::ChatCompletionTools;
 use serde_json::json;
@@ -337,71 +338,112 @@ fn audit(session_key: &str, tool: &str, detail: &str, decision: &str) {
 /// Returns the combined output report and whether it was cancelled.
 pub async fn exec_shell(
     session_key: &str,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
     command: &str,
     cwd: &std::path::Path,
     cancel: &mut watch::Receiver<bool>,
-) -> (String, bool) {
+) -> (String, bool, Option<TerminalId>) {
     if let Some(reason) = screen_command(command) {
         audit(session_key, TOOL_RUN, command, "blocked");
-        return (reason, false);
+        return (reason, false, None);
     }
     audit(session_key, TOOL_RUN, command, "exec");
-    let mut child = match tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => return (format!("执行失败：{err}"), false),
+    let started = std::time::Instant::now();
+    let create = CreateTerminalRequest::new(session_id.clone(), "sh")
+        .args(vec!["-c".to_string(), command.to_string()])
+        .cwd(cwd.to_path_buf())
+        .output_byte_limit(64 * 1024);
+    let terminal_id = match cx.send_request(create).block_task().await {
+        Ok(response) => response.terminal_id,
+        Err(err) => return (format!("创建终端失败：{err}"), false, None),
     };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let drain = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        if let Some(mut pipe) = stdout {
-            let _ = pipe.read_to_end(&mut out).await;
-        }
-        if let Some(mut pipe) = stderr {
-            let _ = pipe.read_to_end(&mut err).await;
-        }
-        (out, err)
-    });
     let mut cancel_wait = cancel.clone();
-    let status = tokio::select! {
-        status = child.wait() => Some(status),
+    let exited = tokio::select! {
+        result = cx
+            .send_request(WaitForTerminalExitRequest::new(
+                session_id.clone(),
+                terminal_id.clone(),
+            ))
+            .block_task() => Some(result),
         _ = cancel_wait.wait_for(|cancelled| *cancelled) => None,
     };
-    match status {
-        Some(Ok(exit)) => {
-            let (out, err) = drain.await.unwrap_or_default();
-            let mut text = String::from_utf8_lossy(&out).into_owned();
-            let stderr_text = String::from_utf8_lossy(&err);
-            if !stderr_text.is_empty() {
-                text.push_str("\n[stderr]\n");
-                text.push_str(&stderr_text);
-            }
-            if !exit.success() {
-                text.push_str(&format!("\n[exit {exit}]"));
-            }
-            (text, false)
+    let (exit_code, was_cancelled) = match exited {
+        Some(Ok(response)) => (response.exit_status.exit_code, false),
+        Some(Err(err)) => {
+            let _ = cx
+                .send_request(ReleaseTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .block_task()
+                .await;
+            return (format!("等待终端退出失败：{err}"), false, None);
         }
-        Some(Err(err)) => (format!("执行失败：{err}"), false),
         None => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            drain.abort();
-            ("命令被取消。".to_string(), true)
+            let _ = cx
+                .send_request(KillTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .block_task()
+                .await;
+            let _ = cx
+                .send_request(ReleaseTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .block_task()
+                .await;
+            return ("命令被取消。".to_string(), true, None);
         }
-    }
+    };
+    let output = match cx
+        .send_request(TerminalOutputRequest::new(
+            session_id.clone(),
+            terminal_id.clone(),
+        ))
+        .block_task()
+        .await
+    {
+        Ok(response) => {
+            let mut text = response.output;
+            if response.truncated {
+                text.push_str("\n…（终端输出截断）");
+            }
+            text
+        }
+        Err(err) => format!("\n[读取终端输出失败：{err}]"),
+    };
+    let _ = cx
+        .send_request(ReleaseTerminalRequest::new(
+            session_id.clone(),
+            terminal_id.clone(),
+        ))
+        .block_task()
+        .await;
+    // Always report exit code and wall time: this is the execution
+    // detail the client card shows under the result.
+    let mut text = output;
+    text.push_str(&format!(
+        "\n[exit {} in {:.1}s]",
+        exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string()),
+        started.elapsed().as_secs_f32()
+    ));
+    (text, was_cancelled, Some(terminal_id))
 }
 
-/// Read a text file, truncated past 8 KiB. Paths are checked first.
-pub async fn exec_read(session_key: &str, cwd: &std::path::Path, path: &str) -> String {
+/// Read a text file through the client (`fs/read_text_file`), truncated
+/// past 8 KiB for the model. Paths are checked first.
+pub async fn exec_read(
+    session_key: &str,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    cwd: &std::path::Path,
+    path: &str,
+) -> String {
     let target = match check_path(cwd, path) {
         Ok(target) => target,
         Err(reason) => {
@@ -411,21 +453,35 @@ pub async fn exec_read(session_key: &str, cwd: &std::path::Path, path: &str) -> 
     };
     audit(session_key, TOOL_READ, path, "exec");
     const LIMIT: usize = 8000;
-    match tokio::fs::read_to_string(&target).await {
-        Ok(content) => {
-            if content.len() > LIMIT {
-                format!("{}…（截断，只显示前 {LIMIT} 字节）", &content[..LIMIT])
+    match cx
+        .send_request(ReadTextFileRequest::new(session_id.clone(), target).limit(1000))
+        .block_task()
+        .await
+    {
+        Ok(response) => {
+            if response.content.len() > LIMIT {
+                let mut end = LIMIT;
+                while !response.content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!(
+                    "{}…（截断，只显示前 {LIMIT} 字节）",
+                    &response.content[..end]
+                )
             } else {
-                content
+                response.content
             }
         }
         Err(err) => format!("读取失败：{err}"),
     }
 }
 
-/// Write text to a file, creating or overwriting it. Paths are checked first.
+/// Write text through the client (`fs/write_text_file`). Paths are checked
+/// first. Returns the report plus the previous content (for diff rendering).
 pub async fn exec_write(
     session_key: &str,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
     cwd: &std::path::Path,
     path: &str,
     content: &str,
@@ -438,9 +494,22 @@ pub async fn exec_write(
         }
     };
     audit(session_key, TOOL_WRITE, path, "exec");
-    let old_text = tokio::fs::read_to_string(&target).await.ok();
-    match tokio::fs::write(&target, content).await {
-        Ok(()) => (
+    let old_text = cx
+        .send_request(ReadTextFileRequest::new(session_id.clone(), target.clone()))
+        .block_task()
+        .await
+        .map(|response| response.content)
+        .ok();
+    match cx
+        .send_request(WriteTextFileRequest::new(
+            session_id.clone(),
+            target.clone(),
+            content,
+        ))
+        .block_task()
+        .await
+    {
+        Ok(_) => (
             format!("已写入 {}（{} 字节）", target.display(), content.len()),
             old_text,
         ),
@@ -517,8 +586,15 @@ pub async fn execute_local(
     // `output` (fed back to the model) stays the full report.
     let (output, content, locations, raw_output) = match tool {
         TOOL_RUN => {
-            let (report, was_cancelled) =
-                exec_shell(ctx.session_key, get("command"), &cwd, cancel).await;
+            let (report, was_cancelled, terminal_id) = exec_shell(
+                ctx.session_key,
+                ctx.cx,
+                ctx.session_id,
+                get("command"),
+                &cwd,
+                cancel,
+            )
+            .await;
             if was_cancelled {
                 let _ = ctx.cx.send_notification(tool_update(
                     ctx.session_id,
@@ -528,20 +604,32 @@ pub async fn execute_local(
                 ));
                 return ToolOutcome { output: report, cancelled: true };
             }
-            let content = vec![ToolCallContent::from(clip(&report, 2000))];
+            // Embed the live client terminal first, then the captured text.
+            let mut content = Vec::new();
+            if let Some(terminal_id) = terminal_id {
+                content.push(ToolCallContent::Terminal(Terminal::new(terminal_id)));
+            }
+            content.push(ToolCallContent::from(clip(&report, 2000)));
             let raw = serde_json::Value::String(clip(&report, 4000));
             (report, content, Vec::new(), Some(raw))
         }
         TOOL_READ => {
-            let report = exec_read(ctx.session_key, &cwd, get("path")).await;
+            let report = exec_read(ctx.session_key, ctx.cx, ctx.session_id, &cwd, get("path")).await;
             let locations = resolve_location(&cwd, get("path"));
             let content = vec![ToolCallContent::from(clip(&report, 2000))];
             (report, content, locations, None)
         }
         TOOL_WRITE => {
             let path = get("path");
-            let (report, old_text) =
-                exec_write(ctx.session_key, &cwd, path, get("content")).await;
+            let (report, old_text) = exec_write(
+                ctx.session_key,
+                ctx.cx,
+                ctx.session_id,
+                &cwd,
+                path,
+                get("content"),
+            )
+            .await;
             let locations = resolve_location(&cwd, path);
             let new_text = clip(get("content"), 2000);
             let abs = locations
