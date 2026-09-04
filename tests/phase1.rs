@@ -331,3 +331,52 @@ async fn phase1_auth_method_advertised_and_usable() {
     let frame = peer.next_frame().await;
     assert!(frame.get("error").is_some(), "expected error, got {frame}");
 }
+
+#[tokio::test]
+async fn phase1_load_replays_history() {
+    let _live = LIVE.lock().await;
+    let mut peer = Peer::spawn().await;
+    let session = new_session(&mut peer).await;
+    let (result, _) = prompt(
+        &mut peer,
+        &session,
+        "Remember this codename: Blueberry. Reply with exactly: stored.",
+    )
+    .await;
+    assert_eq!(result["stopReason"], json!("end_turn"));
+
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/load",
+        "params":{"sessionId": session, "cwd": "/tmp", "mcpServers": []}}))
+        .await;
+    let mut replay = String::new();
+    let modes = loop {
+        let frame = peer.next_frame().await;
+        if frame.get("id") == Some(&json!(id)) {
+            assert!(frame.get("error").is_none(), "load failed: {}", frame["error"]);
+            break frame["result"]["modes"].clone();
+        }
+        if frame.get("method") == Some(&json!("session/update")) {
+            let update = &frame["params"]["update"];
+            let kind = update.get("sessionUpdate");
+            if (kind == Some(&json!("user_message_chunk"))
+                || kind == Some(&json!("agent_message_chunk")))
+                && let Some(t) = update["content"]["text"].as_str()
+            {
+                replay.push_str(t);
+            }
+        }
+    };
+    assert!(modes.get("availableModes").is_some());
+    assert!(replay.contains("Blueberry"), "history not replayed: {replay}");
+
+    // Unknown sessions are rejected.
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/load",
+        "params":{"sessionId": "nope", "cwd": "/tmp", "mcpServers": []}}))
+        .await;
+    let frame = peer.next_frame().await;
+    assert!(frame.get("error").is_some(), "expected error, got {frame}");
+}

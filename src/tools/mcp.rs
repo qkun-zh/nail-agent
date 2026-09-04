@@ -179,8 +179,11 @@ fn hash8(input: &str) -> String {
 
 /// Connected MCP servers, keyed by ACP session.
 pub struct McpPool {
-    inner: Mutex<HashMap<String, Vec<(String, std::sync::Arc<Mutex<ServerConn>>)>>>,
+    inner: Mutex<HashMap<String, Vec<ServerEntry>>>,
 }
+
+/// One connected server: its name plus a shared handle.
+type ServerEntry = (String, std::sync::Arc<Mutex<ServerConn>>);
 
 impl McpPool {
     pub fn new() -> Self {
@@ -230,7 +233,7 @@ impl McpPool {
             }
         }
         // List tools from every connected server.
-        let conns: Vec<(String, std::sync::Arc<Mutex<ServerConn>>)> = self
+        let conns: Vec<ServerEntry> = self
             .inner
             .lock()
             .await
@@ -333,11 +336,7 @@ pub struct McpToolOutcome {
 /// Run one model-requested MCP tool: permission first, then the server call.
 /// Cancellation drops (and kills) the server connection; it reconnects lazily.
 pub async fn execute_mcp(
-    sessions: &crate::core::Sessions,
-    cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
-    session_id: &agent_client_protocol::schema::v1::SessionId,
-    session_key: &str,
-    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    ctx: &mut super::CallCtx<'_>,
     pool: &McpPool,
     namespaced: &str,
     arguments: &str,
@@ -346,6 +345,7 @@ pub async fn execute_mcp(
     use agent_client_protocol::schema::v1::ToolCallStatus;
 
     let done = |output: String| McpToolOutcome { output, cancelled: false };
+    let cancel: &mut tokio::sync::watch::Receiver<bool> = &mut *ctx.cancel;
     let Some((server, tool)) = McpPool::split_namespaced(namespaced) else {
         return done(format!("未知工具：{namespaced}"));
     };
@@ -355,28 +355,37 @@ pub async fn execute_mcp(
     };
     let tool_id = format!("mcp-{namespaced}");
     let title = format!("{server}: {tool}");
-    if !ensure_permission(sessions, cx, session_id, session_key, &tool_id, namespaced, &title).await
+    if !ensure_permission(
+        ctx.sessions,
+        ctx.cx,
+        ctx.session_id,
+        ctx.session_key,
+        &tool_id,
+        namespaced,
+        &title,
+    )
+    .await
     {
-        let _ = cx.send_notification(tool_update(
-            session_id,
+        let _ = ctx.cx.send_notification(tool_update(
+            ctx.session_id,
             &tool_id,
             &title,
             ToolCallStatus::Failed,
         ));
         return done("用户拒绝了这次工具调用。".to_string());
     }
-    let _ = cx.send_notification(tool_update(
-        session_id,
+    let _ = ctx.cx.send_notification(tool_update(
+        ctx.session_id,
         &tool_id,
         &title,
         ToolCallStatus::InProgress,
     ));
     let output = tokio::select! {
-        result = pool.call(session_key, server, tool, args) => {
+        result = pool.call(ctx.session_key, server, tool, args) => {
             match result {
                 Ok(output) => {
-                    let _ = cx.send_notification(tool_update(
-                        session_id,
+                    let _ = ctx.cx.send_notification(tool_update(
+                        ctx.session_id,
                         &tool_id,
                         &title,
                         ToolCallStatus::Completed,
@@ -384,8 +393,8 @@ pub async fn execute_mcp(
                     output
                 }
                 Err(err) => {
-                    let _ = cx.send_notification(tool_update(
-                        session_id,
+                    let _ = ctx.cx.send_notification(tool_update(
+                        ctx.session_id,
                         &tool_id,
                         &title,
                         ToolCallStatus::Failed,
@@ -395,9 +404,9 @@ pub async fn execute_mcp(
             }
         }
         _ = crate::llm::Llm::cancelled(cancel) => {
-            pool.drop_server(session_key, server).await;
-            let _ = cx.send_notification(tool_update(
-                session_id,
+            pool.drop_server(ctx.session_key, server).await;
+            let _ = ctx.cx.send_notification(tool_update(
+                ctx.session_id,
                 &tool_id,
                 &title,
                 ToolCallStatus::Failed,

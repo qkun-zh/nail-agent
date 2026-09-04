@@ -8,11 +8,11 @@
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
-    CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionId, SessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason, TextContent,
+    CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionMode,
+    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use tokio::sync::watch;
@@ -47,10 +47,12 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
                             "Model API key",
                         ))])
                         .agent_capabilities(
-                            AgentCapabilities::new().session_capabilities(
-                                SessionCapabilities::new()
-                                    .resume(SessionResumeCapabilities::new()),
-                            ),
+                            AgentCapabilities::new()
+                                .load_session(true)
+                                .session_capabilities(
+                                    SessionCapabilities::new()
+                                        .resume(SessionResumeCapabilities::new()),
+                                ),
                         )
                         .agent_info(Implementation::new(
                             "nail-agent",
@@ -162,11 +164,52 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // `session/load` — restore the session and replay its transcript so
+        // the client can render history (user/assistant text; tool traffic
+        // is execution detail and stays out of the replay).
         .on_receive_request(
             {
                 let sessions = sessions.clone();
-                async move |request: ResumeSessionRequest, responder, _cx| {
+                async move |request: LoadSessionRequest,
+                            responder,
+                            cx: ConnectionTo<Client>| {
                     let key: &str = &request.session_id.0;
+                    if !sessions.restore(key) {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_request()
+                                .data(format!("unknown session {key}")),
+                        );
+                    }
+                    sessions.set_mcp_servers(key, request.mcp_servers);
+                    let transcript = sessions.transcript_of(key).unwrap_or_default();
+                    for message in &transcript {
+                        let Some((is_user, text)) = message_text(message) else {
+                            continue;
+                        };
+                        let update = if is_user {
+                            SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(text)),
+                            ))
+                        } else {
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(text)),
+                            ))
+                        };
+                        let _ = cx.send_notification(SessionNotification::new(
+                            request.session_id.clone(),
+                            update,
+                        ));
+                    }
+                    responder
+                        .respond(LoadSessionResponse::new().modes(advertised_modes()))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let sessions = sessions.clone();
+                async move |request: ResumeSessionRequest, responder, _cx| {                    let key: &str = &request.session_id.0;
                     if sessions.restore(key) {
                         // Fresh server list wins over whatever was stored.
                         sessions.set_mcp_servers(key, request.mcp_servers);
@@ -276,6 +319,58 @@ async fn run_turn(
     Ok(())
 }
 
+/// Extract replayable (user, text) or (assistant, text) from a transcript
+/// message. Tool traffic is skipped: it is execution detail, and replaying
+/// stale tool calls could confuse the client. Returns the role flag plus text.
+fn message_text(
+    message: &async_openai::types::chat::ChatCompletionRequestMessage,
+) -> Option<(bool, String)> {
+    use async_openai::types::chat::{
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+        ChatCompletionRequestUserMessageContent,
+    };
+    match message {
+        ChatCompletionRequestMessage::User(msg) => {
+            let text = match &msg.content {
+                ChatCompletionRequestUserMessageContent::Text(text) => text.clone(),
+                ChatCompletionRequestUserMessageContent::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(
+                            t,
+                        ) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            if text.is_empty() { None } else { Some((true, text)) }
+        }
+        ChatCompletionRequestMessage::Assistant(msg) => {
+            let content = msg.content.as_ref()?;
+            let text = match content {
+                ChatCompletionRequestAssistantMessageContent::Text(text) => text.clone(),
+                ChatCompletionRequestAssistantMessageContent::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(
+                            t,
+                        ) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            if text.is_empty() {
+                None
+            } else {
+                Some((false, text))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Upper bound on model→tool→model rounds per prompt turn.
 const MAX_TOOL_TURNS: usize = 8;
 
@@ -294,8 +389,7 @@ async fn run_chat_loop(
     llm: &Llm,
     transcript: &mut Vec<async_openai::types::chat::ChatCompletionRequestMessage>,
 ) -> StopReason {
-    use crate::tools::{execute_local, local_tool_defs};
-    use crate::tools::mcp::execute_mcp;
+    use crate::tools::local_tool_defs;
 
     let mut tools = local_tool_defs();
     // Merge MCP tools (connects missing servers lazily).
@@ -353,27 +447,23 @@ async fn run_chat_loop(
                 transcript.push(assistant);
                 let mut stopped = false;
                 for call in &calls {
+                    let mut ctx = crate::tools::CallCtx {
+                        sessions,
+                        cx,
+                        session_id,
+                        session_key,
+                        cancel,
+                    };
                     let (output, was_cancelled) = match call.name.as_str() {
                         "run" | "read" | "write" => {
-                            let result = execute_local(
-                                sessions,
-                                cx,
-                                session_id,
-                                session_key,
-                                cancel,
-                                &call.name,
-                                &call.arguments,
-                            )
-                            .await;
+                            let result =
+                                crate::tools::execute_local(&mut ctx, &call.name, &call.arguments)
+                                    .await;
                             (result.output, result.cancelled)
                         }
                         namespaced => {
-                            let result = execute_mcp(
-                                sessions,
-                                cx,
-                                session_id,
-                                session_key,
-                                cancel,
+                            let result = crate::tools::mcp::execute_mcp(
+                                &mut ctx,
                                 pool,
                                 namespaced,
                                 &call.arguments,

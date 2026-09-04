@@ -406,20 +406,26 @@ pub struct ToolOutcome {
     pub cancelled: bool,
 }
 
+/// Shared per-call context: one struct keeps tool entry points small.
+pub(crate) struct CallCtx<'a> {
+    pub(crate) sessions: &'a Sessions,
+    pub(crate) cx: &'a ConnectionTo<Client>,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) session_key: &'a str,
+    pub(crate) cancel: &'a mut watch::Receiver<bool>,
+}
+
 static TOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Run one model-requested local tool: permission first, then execute.
 /// Every path reports ACP status updates under a single tool-call id.
 pub async fn execute_local(
-    sessions: &Sessions,
-    cx: &ConnectionTo<Client>,
-    session_id: &SessionId,
-    session_key: &str,
-    cancel: &mut watch::Receiver<bool>,
+    ctx: &mut CallCtx<'_>,
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
     use std::sync::atomic::Ordering;
+    let cancel: &mut watch::Receiver<bool> = &mut *ctx.cancel;
     let done = |output: String| ToolOutcome { output, cancelled: false };
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(args) => args,
@@ -437,29 +443,29 @@ pub async fn execute_local(
         tool,
         TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    if !ensure_permission(sessions, cx, session_id, session_key, &tool_id, tool, &title).await {
-        let _ = cx.send_notification(tool_update(
-            session_id,
+    if !ensure_permission(ctx.sessions, ctx.cx, ctx.session_id, ctx.session_key, &tool_id, tool, &title).await {
+        let _ = ctx.cx.send_notification(tool_update(
+            ctx.session_id,
             &tool_id,
             &title,
             ToolCallStatus::Failed,
         ));
         return done("用户拒绝了这次工具调用。".to_string());
     }
-    let _ = cx.send_notification(tool_update(
-        session_id,
+    let _ = ctx.cx.send_notification(tool_update(
+        ctx.session_id,
         &tool_id,
         &title,
         ToolCallStatus::InProgress,
     ));
-    let cwd = session_cwd(sessions, session_key);
+    let cwd = session_cwd(ctx.sessions, ctx.session_key);
     let output = match tool {
         TOOL_RUN => {
             let (report, was_cancelled) =
-                exec_shell(session_key, get("command"), &cwd, cancel).await;
+                exec_shell(ctx.session_key, get("command"), &cwd, cancel).await;
             if was_cancelled {
-                let _ = cx.send_notification(tool_update(
-                    session_id,
+                let _ = ctx.cx.send_notification(tool_update(
+                    ctx.session_id,
                     &tool_id,
                     &title,
                     ToolCallStatus::Failed,
@@ -468,12 +474,12 @@ pub async fn execute_local(
             }
             report
         }
-        TOOL_READ => exec_read(session_key, &cwd, get("path")).await,
-        TOOL_WRITE => exec_write(session_key, &cwd, get("path"), get("content")).await,
+        TOOL_READ => exec_read(ctx.session_key, &cwd, get("path")).await,
+        TOOL_WRITE => exec_write(ctx.session_key, &cwd, get("path"), get("content")).await,
         _ => unreachable!(),
     };
-    let _ = cx.send_notification(tool_update(
-        session_id,
+    let _ = ctx.cx.send_notification(tool_update(
+        ctx.session_id,
         &tool_id,
         &title,
         ToolCallStatus::Completed,
