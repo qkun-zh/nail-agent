@@ -269,22 +269,36 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
 }
 
 /// Pull printable text out of a prompt's content blocks.
+///
+/// Text and embedded text resources feed the model; resource links contribute
+/// their URI; images/audio arrive as placeholders (no vision support yet) so
+/// a prompt never degrades to silent emptiness without a trace.
 fn prompt_text(prompt: &[ContentBlock]) -> String {
+    use agent_client_protocol::schema::v1::EmbeddedResourceResource;
     let mut out = String::new();
+    let mut push = |piece: &str| {
+        if piece.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(piece);
+    };
     for block in prompt {
         match block {
-            ContentBlock::Text(text) => {
-                if !out.is_empty() {
-                    out.push('\n');
+            ContentBlock::Text(text) => push(&text.text),
+            ContentBlock::ResourceLink(link) => push(&link.uri),
+            ContentBlock::Resource(embedded) => match &embedded.resource {
+                EmbeddedResourceResource::TextResourceContents(contents) => {
+                    push(&contents.text);
                 }
-                out.push_str(&text.text);
-            }
-            ContentBlock::ResourceLink(link) => {
-                if !out.is_empty() {
-                    out.push('\n');
+                EmbeddedResourceResource::BlobResourceContents(contents) => {
+                    push(&format!("（收到二进制资源：{}）", contents.uri));
                 }
-                out.push_str(&link.uri);
-            }
+                _ => {}
+            },
+            ContentBlock::Image(_) => push("（收到一张图片，暂不支持图像理解）"),
             _ => {}
         }
     }
@@ -303,7 +317,7 @@ async fn run_turn(
     text: String,
     responder: Responder<PromptResponse>,
 ) -> agent_client_protocol::Result<()> {
-    let mut cancel = match sessions.cancel_watcher(&session_key) {
+    let mut cancel = match sessions.begin_turn(&session_key) {
         Some(watcher) => watcher,
         None => {
             let _ = responder.respond_with_error(agent_client_protocol::Error::invalid_request()
@@ -311,11 +325,35 @@ async fn run_turn(
             return Ok(());
         }
     };
-    sessions.set_state(&session_key, SessionState::Active);
-
     let model = sessions
         .mode_of(&session_key)
         .unwrap_or_else(|| llm::DEFAULT_MODEL.to_string());
+    if text.trim().is_empty() {
+        let stop = if stream_text(
+            &cx,
+            &session_id,
+            &mut cancel,
+            "收到的是空提示（无文本内容），请直接输入问题。",
+        )
+        .await
+        {
+            StopReason::EndTurn
+        } else {
+            StopReason::Cancelled
+        };
+        sessions.save_transcript(&session_key, sessions.transcript_of(&session_key).unwrap_or_default());
+        sessions.set_state(
+            &session_key,
+            match stop {
+                StopReason::EndTurn => SessionState::Completed,
+                StopReason::Cancelled => SessionState::Cancelled,
+                _ => SessionState::Failed,
+            },
+        );
+        sessions.bump_turn(&session_key);
+        let _ = responder.respond(PromptResponse::new(stop));
+        return Ok(());
+    }
     let mut transcript = sessions.transcript_of(&session_key).unwrap_or_default();
     transcript.push(Llm::user(&text));
 

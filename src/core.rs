@@ -287,8 +287,17 @@ impl Sessions {
         }
     }
 
-    pub fn cancel_watcher(&self, id: &str) -> Option<watch::Receiver<bool>> {
-        self.lock().get(id).map(|s| s.cancel_rx.clone())
+    /// Begin a turn: mark Active, clear any stale cancellation flag, hand
+    /// out the watcher. The clear matters: a `session/cancel` that lands on
+    /// an idle session must NOT poison the next turn (it used to — the flag
+    /// stayed set and the following prompt died instantly with zero output).
+    pub fn begin_turn(&self, id: &str) -> Option<watch::Receiver<bool>> {
+        let mut lock = self.lock();
+        let session = lock.get_mut(id)?;
+        session.state = SessionState::Active;
+        session.last_activity_at = now_unix();
+        let _ = session.cancel_tx.send(false);
+        Some(session.cancel_rx.clone())
     }
 
     /// Mark the session cancelled. Returns `false` when unknown.

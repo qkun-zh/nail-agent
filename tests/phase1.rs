@@ -73,8 +73,7 @@ impl Peer {
         serde_json::from_str(&line).expect("agent frame is JSON")
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {
-        let id = self.next_id;
+    async fn request(&mut self, method: &str, params: Value) -> (Value, Vec<Value>) {        let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await;
@@ -105,6 +104,11 @@ impl Peer {
             }
         }
         out
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.send(&json!({"jsonrpc":"2.0","method":method,"params":params}))
+            .await;
     }
 }
 
@@ -539,4 +543,23 @@ async fn phase1_octofs_embedded() {
         "expected an octofs shell tool_call"
     );
     assert!(Peer::agent_text(&notifs).contains("octofs-ok"));
+}
+
+/// A cancel landing on an idle session must not poison the next turn.
+/// Regression: the flag used to stay set and the following prompt died
+/// instantly with zero output, zero thought, zero usage.
+#[tokio::test]
+async fn phase1_idle_cancel_does_not_poison_next_turn() {
+    let _live = LIVE.lock().await;
+    let mut peer = Peer::spawn().await;
+    let session = new_session(&mut peer).await;
+
+    // Cancel with nothing running.
+    peer.notify("session/cancel", json!({"sessionId": session})).await;
+    // Give the notification a moment to be processed.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let (result, text) = prompt(&mut peer, &session, "Reply with exactly: ok").await;
+    assert_eq!(result["stopReason"], json!("end_turn"));
+    assert!(text.contains("ok"), "turn was poisoned by idle cancel: {text}");
 }
