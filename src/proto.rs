@@ -325,6 +325,7 @@ async fn run_turn(
             // Report cumulative session usage so the client can display cost.
             // Window comes from the per-model table (no API exposes it).
             let used = sessions.add_usage(&session_key, usage).total();
+            tracing::info!(session = %session_key, used, "turn usage total");
             if used > 0 {
                 let _ = cx.send_notification(SessionNotification::new(
                     session_id.clone(),
