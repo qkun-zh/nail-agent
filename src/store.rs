@@ -31,17 +31,47 @@ pub struct Store {
 
 impl Store {
     /// Open (creating parents as needed) the database file.
+    ///
+    /// A corrupted file (e.g. torn by a previous concurrent writer) is moved
+    /// aside to `<name>.corrupt-<unix_ts>` and replaced with a fresh database
+    /// instead of refusing to start — an agent that won't boot helps nobody.
+    /// Concurrent writers from *separate processes* are still unsupported:
+    /// run a single server (Zed guarantees this) and point tests at
+    /// `NAIL_DATA_DIR`.
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|e| format!("store dir: {e}"))?;
         }
-        let filename = path.to_str().ok_or("non-utf8 store path")?;
-        let db = DbAny::new_mapped(filename).map_err(|e| format!("open store: {e}"))?;
-        Ok(Self {
-            db: Mutex::new(db),
-        })
+        let filename = path
+            .to_str()
+            .ok_or("non-utf8 store path")?
+            .to_string();
+        match DbAny::new_mapped(filename.as_str()) {
+            Ok(db) => Ok(Self {
+                db: Mutex::new(db),
+            }),
+            Err(first) => {
+                if !std::path::Path::new(&filename).exists() {
+                    return Err(format!("open store: {first}"));
+                }
+                let backup = format!(
+                    "{filename}.corrupt-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                );
+                tracing::warn!("session store corrupted, moving aside to {backup}: {first}");
+                std::fs::rename(&filename, &backup).map_err(|e| {
+                    format!("open store: {first}; backup also failed: {e}")
+                })?;
+                let db =
+                    DbAny::new_mapped(filename.as_str()).map_err(|e| format!("recreate store: {e}"))?;
+                Ok(Self { db: Mutex::new(db) })
+            }
+        }
     }
 
     fn alias(id: &str) -> String {
@@ -175,8 +205,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_path_games_in_id() {
-        let (store, _dir) = test_store();
+    fn corrupt_file_is_moved_aside_and_recreated() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("s.db");
+        std::fs::write(&path, b"garbage bytes, not a database").expect("write");
+        let store = Store::open(&path).expect("open recovers");
+        store
+            .save(
+                "s1",
+                &StoredSession {
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    mode: "m".to_string(),
+                    transcript: vec![],
+                },
+            )
+            .expect("save after recovery");
+        assert!(store.load("s1").expect("load").is_some());
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("s.db.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn rejects_path_games_in_id() {        let (store, _dir) = test_store();
         store
             .save(
                 "../evil",

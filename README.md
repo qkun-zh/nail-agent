@@ -42,7 +42,8 @@ prompt. Threads reopen from history via `session/resume`.
 - initialize (+ `agent`-type `api-key` auth method), session/new/load-guard,
   prompt (spawned turns), cancel (interrupts streams, kills children),
   close, resume + load (AgDb-backed, history replay), set_mode, authenticate
-- streamed replies with per-turn token usage (`usage_update`)
+- streamed replies with per-turn token usage (`usage_update`) and visible
+  thinking (`agent_thought_chunk`, via `byot` chunk types)
 - permission-gated tools (allow-once/always/reject) with rich reports:
   inline content, file locations, raw I/O, and real diffs for writes
 - safety: cwd confinement, sensitive-path refusal, destructive-command
