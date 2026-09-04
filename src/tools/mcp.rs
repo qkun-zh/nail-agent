@@ -410,8 +410,7 @@ pub async fn execute_mcp(
     let title = format!("{server}: {tool}");
     // Defense in depth: our own screens still apply to MCP calls, including
     // the embedded octofs shell (octofs scopes itself with --path on top).
-    if tool == "shell"
-        && let Some(args_obj) = args.as_object()
+    if tool == "shell"        && let Some(args_obj) = args.as_object()
         && let Some(command) = args_obj.get("command").and_then(|c| c.as_str())
         && let Some(reason) = super::screen_command(command)
     {

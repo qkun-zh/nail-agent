@@ -71,10 +71,13 @@ pub fn local_tool_defs() -> Vec<ChatCompletionTools> {
 }
 
 fn tool_kind(tool: &str) -> ToolKind {
-    match tool {
-        TOOL_READ => ToolKind::Read,
-        TOOL_WRITE => ToolKind::Edit,
-        TOOL_RUN => ToolKind::Execute,
+    // Namespaced MCP tools (`server__tool`) map by suffix so clients that
+    // key rendering off `kind` (Zed does) behave the same as built-ins.
+    let base = tool.rsplit("__").next().unwrap_or(tool);
+    match base {
+        "read" | "view" => ToolKind::Read,
+        "write" | "text_editor" | "batch_edit" => ToolKind::Edit,
+        "run" | "shell" => ToolKind::Execute,
         _ => ToolKind::Other,
     }
 }
