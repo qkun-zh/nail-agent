@@ -31,9 +31,17 @@ impl Peer {
 
     /// Spawn sharing one data dir (for cross-process resume tests).
     async fn spawn_in(dir: std::path::PathBuf) -> Self {
+        Self::spawn_in_with_env(dir, &[]).await
+    }
+
+    async fn spawn_in_with_env(dir: std::path::PathBuf, envs: &[(&str, &str)]) -> Self {
         let exe = env!("CARGO_BIN_EXE_nail-agent");
-        let mut child = Command::new(exe)
-            .env("NAIL_DATA_DIR", &dir)
+        let mut cmd = Command::new(exe);
+        cmd.env("NAIL_DATA_DIR", &dir);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -480,4 +488,55 @@ async fn phase1_thought_chunks_stream() {
     };
     assert_eq!(stop, json!("end_turn"));
     assert!(!thought.is_empty(), "expected thought chunks");
+}
+
+/// octofs auto-attaches per session and shadows the built-in tools.
+#[tokio::test]
+async fn phase1_octofs_embedded() {
+    let octofs = "/home/qkun/agent/nail-agent/tools/octofs/target/release/octofs";
+    if !std::path::Path::new(octofs).is_file() {
+        eprintln!("SKIP: octofs binary not built at {octofs}");
+        return;
+    }
+    let _live = LIVE.lock().await;
+    let dir = std::env::temp_dir().join(format!("nail-octofs-{}", std::process::id()));
+    let mut peer = Peer::spawn_in_with_env(dir, &[("OCTOFS_BIN", octofs)]).await;
+    let session = new_session(&mut peer).await;
+
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+        "params":{"sessionId": session, "prompt": [{
+            "type": "text",
+            "text": "You MUST call the octofs__shell tool with command `echo octofs-ok`, then reply with the tool result and nothing else."
+        }]}}))
+        .await;
+    let mut notifs = Vec::new();
+    let stop = loop {
+        let frame = peer.next_frame().await;
+        if frame.get("id") == Some(&json!(id)) {
+            assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
+            break frame["result"]["stopReason"].clone();
+        }
+        if frame.get("method") == Some(&json!("session/request_permission")) {
+            let req_id = frame["id"].clone();
+            peer.send(&json!({"jsonrpc":"2.0","id":req_id,
+                "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}))
+                .await;
+            continue;
+        }
+        notifs.push(frame);
+    };
+    assert_eq!(stop, json!("end_turn"));
+    // The call went through the embedded server, not the built-in run tool.
+    assert!(
+        notifs.iter().any(|n| {
+            let update = &n["params"]["update"];
+            update.get("sessionUpdate") == Some(&json!("tool_call"))
+                && update.get("title").and_then(|t| t.as_str()).unwrap_or("")
+                    .starts_with("octofs: shell")
+        }),
+        "expected an octofs shell tool_call"
+    );
+    assert!(Peer::agent_text(&notifs).contains("octofs-ok"));
 }

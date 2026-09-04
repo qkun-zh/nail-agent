@@ -87,7 +87,32 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
                 let sessions = sessions.clone();
                 async move |request: NewSessionRequest, responder, _cx| {
                     let id =
-                        SessionId::from(sessions.create(request.cwd, request.mcp_servers));
+                        SessionId::from(sessions.create(request.cwd.clone(), request.mcp_servers));
+                    // Auto-attach the embedded filesystem server (octofs) scoped
+                    // to the session cwd, unless the client forwarded one already
+                    // or the binary is unavailable (built-ins cover that case).
+                    if let Some(bin) = crate::tools::mcp::octofs_command() {
+                        let has_octofs = sessions
+                            .mcp_servers_of(&id.0)
+                            .map(|servers| {
+                                servers.iter().any(|s| match s {
+                                    agent_client_protocol::schema::v1::McpServer::Stdio(
+                                        cfg,
+                                    ) => cfg.name == crate::tools::mcp::OCTOFS_SERVER,
+                                    _ => false,
+                                })
+                            })
+                            .unwrap_or(false);
+                        if !has_octofs {
+                            let mut servers =
+                                sessions.mcp_servers_of(&id.0).unwrap_or_default();
+                            servers.push(crate::tools::mcp::octofs_server(
+                                &request.cwd,
+                                bin,
+                            ));
+                            sessions.set_mcp_servers(&id.0, servers);
+                        }
+                    }
                     responder.respond(NewSessionResponse::new(id).modes(advertised_modes()))
                 }
             },
@@ -404,17 +429,27 @@ async fn run_chat_loop(
     use crate::tools::local_tool_defs;
 
     let mut tools = local_tool_defs();
-    // Merge MCP tools (connects missing servers lazily).
+    // Merge MCP tools (connects missing servers lazily). When the embedded
+    // octofs server is present it shadows the overlapping built-ins, so the
+    // model sees one coherent toolbox instead of duplicates.
+    let mut mcp_defs = Vec::new();
     if let Some(servers) = sessions.mcp_servers_of(session_key)
         && !servers.is_empty()
     {
-        for def in pool.tools_for(session_key, &servers).await {
-            tools.push(Llm::tool_def(
-                def.namespaced,
-                def.description,
-                def.parameters,
-            ));
-        }
+        mcp_defs = pool.tools_for(session_key, &servers).await;
+    }
+    let has_octofs = mcp_defs
+        .iter()
+        .any(|d| d.server == crate::tools::mcp::OCTOFS_SERVER);
+    if has_octofs {
+        tools.clear();
+    }
+    for def in mcp_defs {
+        tools.push(Llm::tool_def(
+            def.namespaced,
+            def.description,
+            def.parameters,
+        ));
     }
     let mut turn_usage = crate::llm::Usage::default();
     for _ in 0..MAX_TOOL_TURNS {

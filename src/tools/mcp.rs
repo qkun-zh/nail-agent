@@ -182,6 +182,46 @@ pub struct McpPool {
     inner: Mutex<HashMap<String, Vec<ServerEntry>>>,
 }
 
+/// Name of the embedded filesystem server.
+pub const OCTOFS_SERVER: &str = "octofs";
+
+/// Locate the octofs binary: `OCTOFS_BIN` wins, otherwise search `PATH`.
+/// Returns `None` when absent — the caller falls back to built-in tools.
+pub fn octofs_command() -> Option<std::path::PathBuf> {
+    if let Ok(bin) = std::env::var("OCTOFS_BIN")
+        && !bin.is_empty()
+    {
+        let path = std::path::PathBuf::from(bin);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    find_on_path("octofs", &std::env::var("PATH").unwrap_or_default())
+}
+
+fn find_on_path(name: &str, path_var: &str) -> Option<std::path::PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build the auto-attached octofs server entry scoped to `cwd`.
+/// Returns `None` when the binary is unavailable.
+pub fn octofs_server(
+    cwd: &std::path::Path,
+    command: std::path::PathBuf,
+) -> agent_client_protocol::schema::v1::McpServer {
+    use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+    McpServer::Stdio(
+        McpServerStdio::new(OCTOFS_SERVER, command)
+            .args(vec!["mcp".to_string(), "--path".to_string(), cwd.to_string_lossy().into_owned()]),
+    )
+}
+
 /// One connected server: its name plus a shared handle.
 type ServerEntry = (String, std::sync::Arc<Mutex<ServerConn>>);
 
@@ -354,6 +394,17 @@ pub async fn execute_mcp(
     };
     let tool_id = format!("mcp-{namespaced}");
     let title = format!("{server}: {tool}");
+    // Defense in depth: our own screens still apply to MCP calls, including
+    // the embedded octofs shell (octofs scopes itself with --path on top).
+    if tool == "shell"
+        && let Some(args_obj) = args.as_object()
+        && let Some(command) = args_obj.get("command").and_then(|c| c.as_str())
+        && let Some(reason) = super::screen_command(command)
+    {
+        super::audit(ctx.session_key, namespaced, &title, "blocked");
+        return done(reason);
+    }
+    super::audit(ctx.session_key, namespaced, &title, "exec");
     if !ensure_permission(ctx, &tool_id,
         namespaced,
         &title,
