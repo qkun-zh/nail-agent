@@ -1,0 +1,47 @@
+{
+  "id": "nail-agent",
+  "name": "nail-agent",
+  "version": "0.1.0",
+  "description": "Small, clean ACP agent for Zed: streaming chat over 3 switchable models, permission-gated local tools, embedded octofs filesystem server, MCP stdio servers, AgDb session memory with resume, token usage and thinking display.",
+  "repository": "https://github.com/qkun-zh/nail-agent",
+  "license": "MIT",
+  "distribution": {
+    "binary": {
+      "linux-x86_64": {
+        "archive": "https://github.com/qkun-zh/nail-agent/releases/download/v0.1.0/nail-agent-v0.1.0-linux-x86_64.tar.gz",
+        "sha256": "<FILL AFTER RELEASE>",
+        "cmd": "./nail-agent",
+        "args": [],
+        "env": {}
+      },
+      "linux-aarch64": {
+        "archive": "https://github.com/qkun-zh/nail-agent/releases/download/v0.1.0/nail-agent-v0.1.0-linux-aarch64.tar.gz",
+        "sha256": "<FILL AFTER RELEASE>",
+        "cmd": "./nail-agent",
+        "args": [],
+        "env": {}
+      },
+      "darwin-aarch64": {
+        "archive": "https://github.com/qkun-zh/nail-agent/releases/download/v0.1.0/nail-agent-v0.1.0-darwin-aarch64.tar.gz",
+        "sha256": "<FILL AFTER RELEASE>",
+        "cmd": "./nail-agent",
+        "args": [],
+        "env": {}
+      },
+      "darwin-x86_64": {
+        "archive": "https://github.com/qkun-zh/nail-agent/releases/download/v0.1.0/nail-agent-v0.1.0-darwin-x86_64.tar.gz",
+        "sha256": "<FILL AFTER RELEASE>",
+        "cmd": "./nail-agent",
+        "args": [],
+        "env": {}
+      },
+      "windows-x86_64": {
+        "archive": "https://github.com/qkun-zh/nail-agent/releases/download/v0.1.0/nail-agent-v0.1.0-windows-x86_64.zip",
+        "sha256": "<FILL AFTER RELEASE>",
+        "cmd": "./nail-agent.exe",
+        "args": [],
+        "env": {}
+      }
+    }
+  }
+}

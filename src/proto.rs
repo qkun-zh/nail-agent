@@ -323,12 +323,15 @@ async fn run_turn(
         Ok(llm) => {
             let (stop, usage) = run_chat_loop(&sessions, &pool, &cx, &session_id, &session_key, &mut cancel, &model, &llm, &mut transcript).await;
             // Report cumulative session usage so the client can display cost.
-            // 1M context window is what all three session models offer.
+            // Window comes from the per-model table (no API exposes it).
             let used = sessions.add_usage(&session_key, usage).total();
             if used > 0 {
                 let _ = cx.send_notification(SessionNotification::new(
                     session_id.clone(),
-                    SessionUpdate::UsageUpdate(UsageUpdate::new(used, 1_000_000)),
+                    SessionUpdate::UsageUpdate(UsageUpdate::new(
+                        used,
+                        llm::context_window(&model),
+                    )),
                 ));
             }
             stop

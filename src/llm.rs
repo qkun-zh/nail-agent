@@ -36,6 +36,9 @@ pub struct ModelMode {
     pub id: &'static str,
     pub name: &'static str,
     pub description: &'static str,
+    /// Context window in tokens, from vendor docs (there is no API for it:
+    /// DashScope `/models` returns id/object/created/owned_by only).
+    pub context_window: u64,
 }
 
 /// All models this agent can switch between. Only lists models verified
@@ -46,18 +49,30 @@ pub fn available_modes() -> Vec<ModelMode> {
             id: "qwen3.7-flash",
             name: "Qwen3.7 Flash",
             description: "默认，最便宜",
+            context_window: 1_000_000,
         },
         ModelMode {
             id: "deepseek-v4-flash",
             name: "DeepSeek V4 Flash",
             description: "便宜备选",
+            context_window: 1_000_000,
         },
         ModelMode {
             id: "qwen3-coder-flash",
             name: "Qwen Coder Flash",
             description: "代码特化",
+            // Estimate (same family as Qwen3 Coder Next, 262144); correct on evidence.
+            context_window: 262_144,
         },
     ]
+}
+
+/// Context window for a model id; unknown models get a safe 1M default.
+pub fn context_window(model: &str) -> u64 {
+    model_for_mode(model)
+        .and_then(|id| available_modes().into_iter().find(|m| m.id == id))
+        .map(|m| m.context_window)
+        .unwrap_or(1_000_000)
 }
 
 /// Returns the model id for a mode id, or `None` when unknown.
