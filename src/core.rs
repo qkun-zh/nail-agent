@@ -15,13 +15,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 use tokio::sync::watch;
 
-use agent_client_protocol::schema::v1::McpServer;
+use agent_client_protocol::schema::v1::{McpServer, TerminalId};
 
-use crate::llm::DEFAULT_MODEL;
+use crate::llm::default_model;
 use crate::store::{Store, StoredSession, store_path};
 
 /// Max messages kept per transcript; older ones are dropped.
-pub const MAX_TRANSCRIPT: usize = 100;
+/// Override with `NAIL_MAX_TRANSCRIPT`.
+pub fn max_transcript() -> usize {
+    std::env::var("NAIL_MAX_TRANSCRIPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100)
+}
 
 /// Lifecycle states of one ACP session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,15 +86,38 @@ pub struct Sessions {
     inner: Mutex<HashMap<String, Session>>,
     next_id: AtomicU64,
     store: Store,
+    /// Client-side terminals kept alive for tool cards, per session.
+    /// Released on `session/close`.
+    terminals: Mutex<HashMap<String, Vec<TerminalId>>>,
+    /// Sessions already told about skipped non-stdio MCP servers (once each).
+    mcp_warned: Mutex<HashSet<String>>,
 }
 
 impl Sessions {
     pub fn new() -> Result<Arc<Self>, String> {
+        let store = match Store::open(&store_path()) {
+            Ok(store) => store,
+            Err(err) if err.contains("another nail-agent server") => {
+                // Second live process (e.g. another Zed window): stay alive
+                // with session memory only instead of refusing to start.
+                tracing::warn!("{err} Running with in-memory sessions (no resume across restarts in this process).");
+                Store::ephemeral()
+            }
+            Err(err) => return Err(err),
+        };
         Ok(Arc::new(Self {
             inner: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            store: Store::open(&store_path())?,
+            store,
+            terminals: Mutex::new(HashMap::new()),
+            mcp_warned: Mutex::new(HashSet::new()),
         }))
+    }
+
+    /// `false` when this process lost the store race (second Zed window):
+    /// sessions work but do not persist.
+    pub fn is_persistent(&self) -> bool {
+        self.store.is_persistent()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
@@ -104,7 +134,7 @@ impl Sessions {
             Session {
                 state: SessionState::Created,
                 cwd,
-                mode: DEFAULT_MODEL.to_string(),
+                mode: default_model().to_string(),
                 transcript: Vec::new(),
                 mcp_servers,
                 input_tokens: 0,
@@ -122,12 +152,40 @@ impl Sessions {
     /// Drop a session (`session/close`). Returns `false` when unknown.
     pub fn remove(&self, id: &str) -> bool {
         let existed = self.lock().remove(id).is_some();
+        self.terminals.lock().expect("terminals mutex poisoned").remove(id);
         if existed
             && let Err(err) = self.store.delete(id)
         {
             tracing::warn!(session = id, error = %err, "persisted session not deleted");
         }
         existed
+    }
+
+    /// Remember a live client terminal for later release on close.
+    pub fn note_terminal(&self, id: &str, terminal: TerminalId) {
+        self.terminals
+            .lock()
+            .expect("terminals mutex poisoned")
+            .entry(id.to_string())
+            .or_default()
+            .push(terminal);
+    }
+
+    /// Take all tracked terminals for a session (drains the list).
+    pub fn take_terminals(&self, id: &str) -> Vec<TerminalId> {
+        self.terminals
+            .lock()
+            .expect("terminals mutex poisoned")
+            .remove(id)
+            .unwrap_or_default()
+    }
+
+    /// Returns `true` the first time per session (one-shot notices).
+    pub fn mark_mcp_warned(&self, id: &str) -> bool {
+        self.mcp_warned
+            .lock()
+            .expect("mcp_warned mutex poisoned")
+            .insert(id.to_string())
     }
 
     pub fn exists(&self, id: &str) -> bool {
@@ -179,8 +237,20 @@ impl Sessions {
     }
 
     pub fn remember_allow_always(&self, id: &str, tool: &str) {
-        if let Some(session) = self.lock().get_mut(id) {
-            session.always_allowed.insert(tool.to_string());
+        let stored = self.lock().get_mut(id).map(|s| {
+            s.always_allowed.insert(tool.to_string());
+            s.last_activity_at = now_unix();
+            StoredSession {
+                cwd: s.cwd.clone(),
+                mode: s.mode.clone(),
+                transcript: s.transcript.clone(),
+                always_allowed: s.always_allowed.iter().cloned().collect(),
+            }
+        });
+        if let Some(stored) = stored
+            && let Err(err) = self.store.save(id, &stored)
+        {
+            tracing::warn!(session = id, error = %err, "permission memory not persisted");
         }
     }
 
@@ -214,8 +284,9 @@ impl Sessions {
             ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
         };
         const MAX_STORED_TOOL_CHARS: usize = 4000;
-        if transcript.len() > MAX_TRANSCRIPT {
-            transcript.drain(..transcript.len() - MAX_TRANSCRIPT);
+        let cap = max_transcript();
+        if transcript.len() > cap {
+            transcript.drain(..transcript.len() - cap);
         }
         for message in &mut transcript {
             if let ChatCompletionRequestMessage::Tool(tool) = message
@@ -227,7 +298,7 @@ impl Sessions {
                     end -= 1;
                 }
                 text.truncate(end);
-                text.push_str("…（历史截断）");
+                text.push_str("…(history truncated)");
             }
         }
         let stored = self.lock().get_mut(id).map(|s| {
@@ -237,6 +308,7 @@ impl Sessions {
                 cwd: s.cwd.clone(),
                 mode: s.mode.clone(),
                 transcript,
+                always_allowed: s.always_allowed.iter().cloned().collect(),
             }
         });
         if let Some(stored) = stored
@@ -264,6 +336,7 @@ impl Sessions {
         };
         let now = now_unix();
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let always_allowed = stored.always_allowed.iter().cloned().collect();
         self.lock().insert(
             id.to_string(),
             Session {
@@ -275,7 +348,7 @@ impl Sessions {
                 mcp_servers: Vec::new(),
                 input_tokens: 0,
                 output_tokens: 0,
-                always_allowed: HashSet::new(),
+                always_allowed,
                 turn_count: 0,
                 last_activity_at: now,
                 cancel_tx,

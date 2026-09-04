@@ -223,6 +223,18 @@ fn find_on_path(name: &str, path_var: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Whether the embedded octofs auto-attach is enabled.
+/// Set `NAIL_OCTOFS=0` (or `off`/`false`/`no`) to disable it and fall back
+/// to the built-in run/read/write tools.
+pub fn octofs_enabled() -> bool {
+    match std::env::var("NAIL_OCTOFS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => true,
+    }
+}
 /// Build the auto-attached octofs server entry scoped to `cwd`.
 /// Returns `None` when the binary is unavailable.
 pub fn octofs_server(
@@ -246,16 +258,20 @@ impl McpPool {
         }
     }
 
-    /// Connect servers the session doesn't have yet; return all tool defs.
-    /// Non-stdio servers are skipped with a warning.
+    /// Connect servers the session doesn't have yet; return all tool defs
+    /// plus the number of servers skipped for unsupported (non-stdio)
+    /// transports, so the caller can tell the user instead of silently
+    /// dropping their tools.
     pub async fn tools_for(
         &self,
         session_key: &str,
         servers: &[McpServer],
-    ) -> Vec<McpToolDef> {
+    ) -> (Vec<McpToolDef>, usize) {
+        let mut skipped = 0usize;
         for server in servers {
             let McpServer::Stdio(cfg) = server else {
                 tracing::warn!("skipping non-stdio MCP server (unsupported transport)");
+                skipped += 1;
                 continue;
             };
             let already = self
@@ -323,7 +339,7 @@ impl McpPool {
                 );
             }
         }
-        defs
+        (defs, skipped)
     }
 
     /// Call a namespaced tool. The caller resolves `namespaced` first.
@@ -400,13 +416,13 @@ pub async fn execute_mcp(
 
     let done = |output: String| McpToolOutcome { output, cancelled: false };
     let Some((server, tool)) = McpPool::split_namespaced(namespaced) else {
-        return done(format!("未知工具：{namespaced}"));
+        return done(format!("unknown tool: {namespaced}"));
     };
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(_) => return done(format!("工具参数不是合法 JSON（{namespaced}）：{arguments}")),
+        Err(_) => return done(format!("tool arguments are not valid JSON ({namespaced}): {arguments}")),
     };
-    let tool_id = format!("mcp-{namespaced}");
+    let tool_id = format!("mcp-{namespaced}-{}", super::next_tool_seq());
     // Title carries the salient argument so the card shows WHAT ran, not
     // just which tool: `octofs: shell \`echo hi\`` instead of `octofs: shell`.
     let detail = args
@@ -454,7 +470,7 @@ pub async fn execute_mcp(
             &title,
             ToolCallStatus::Failed,
         ));
-        return done("用户拒绝了这次工具调用。".to_string());
+        return done("The user rejected this tool call.".to_string());
     }
     let _ = ctx.cx.send_notification(tool_update(
         ctx.session_id,
@@ -485,7 +501,7 @@ pub async fn execute_mcp(
                         &title,
                         ToolCallStatus::Failed,
                     ));
-                    format!("MCP 工具调用失败：{err}")
+                    format!("MCP tool call failed: {err}")
                 }
             }
         }
@@ -498,7 +514,7 @@ pub async fn execute_mcp(
                 ToolCallStatus::Failed,
             ));
             return McpToolOutcome {
-                output: "调用被取消。".to_string(),
+                output: "Call was cancelled.".to_string(),
                 cancelled: true,
             };
         }

@@ -28,6 +28,7 @@ async fn main() -> Result<(), agent_client_protocol::Error> {
     });
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        persistent = sessions.is_persistent(),
         "nail-agent starting on stdio"
     );
     proto::serve(sessions).await

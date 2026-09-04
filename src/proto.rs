@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
     CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionMode,
+    ResumeSessionRequest, ResumeSessionResponse, ReleaseTerminalRequest, SessionCapabilities, SessionId, SessionMode,
     SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
     SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, UsageUpdate,
 };
@@ -24,7 +24,7 @@ use crate::tools::mcp::McpPool;
 /// Modes broadcast on every new session.
 fn advertised_modes() -> SessionModeState {
     SessionModeState::new(
-        llm::DEFAULT_MODEL,
+        llm::default_model(),
         llm::available_modes()
             .into_iter()
             .map(|m| SessionMode::new(m.id, m.name).description(m.description))
@@ -86,12 +86,22 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
             {
                 let sessions = sessions.clone();
                 async move |request: NewSessionRequest, responder, _cx| {
+                    if !request.cwd.is_dir() {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_request().data(format!(
+                                "session cwd does not exist or is not a directory: {}",
+                                request.cwd.display()
+                            )),
+                        );
+                    }
                     let id =
                         SessionId::from(sessions.create(request.cwd.clone(), request.mcp_servers));
                     // Auto-attach the embedded filesystem server (octofs) scoped
                     // to the session cwd, unless the client forwarded one already
                     // or the binary is unavailable (built-ins cover that case).
-                    if let Some(bin) = crate::tools::mcp::octofs_command() {
+                    if let Some(bin) = crate::tools::mcp::octofs_command()
+                        && crate::tools::mcp::octofs_enabled()
+                    {
                         let has_octofs = sessions
                             .mcp_servers_of(&id.0)
                             .map(|servers| {
@@ -180,8 +190,18 @@ pub async fn serve(sessions: std::sync::Arc<Sessions>) -> Result<(), agent_clien
             {
                 let sessions = sessions.clone();
                 let pool = pool.clone();
-                async move |request: CloseSessionRequest, responder, _cx| {
+                async move |request: CloseSessionRequest, responder, cx: ConnectionTo<Client>| {
                     let key: &str = &request.session_id.0;
+                    // Release client terminals kept alive for tool cards.
+                    for terminal_id in sessions.take_terminals(key) {
+                        let _ = cx
+                            .send_request(ReleaseTerminalRequest::new(
+                                request.session_id.clone(),
+                                terminal_id,
+                            ))
+                            .block_task()
+                            .await;
+                    }
                     sessions.remove(key);
                     pool.drop_session(key).await;
                     responder.respond(CloseSessionResponse::new())
@@ -294,11 +314,11 @@ fn prompt_text(prompt: &[ContentBlock]) -> String {
                     push(&contents.text);
                 }
                 EmbeddedResourceResource::BlobResourceContents(contents) => {
-                    push(&format!("（收到二进制资源：{}）", contents.uri));
+                    push(&format!("(received a binary resource: {})", contents.uri));
                 }
                 _ => {}
             },
-            ContentBlock::Image(_) => push("（收到一张图片，暂不支持图像理解）"),
+            ContentBlock::Image(_) => push("(received an image; image understanding is not supported yet)"),
             _ => {}
         }
     }
@@ -327,13 +347,13 @@ async fn run_turn(
     };
     let model = sessions
         .mode_of(&session_key)
-        .unwrap_or_else(|| llm::DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| llm::default_model().to_string());
     if text.trim().is_empty() {
         let stop = if stream_text(
             &cx,
             &session_id,
             &mut cancel,
-            "收到的是空提示（无文本内容），请直接输入问题。",
+            "Received an empty prompt (no text content); please type your question directly.",
         )
         .await
         {
@@ -376,6 +396,7 @@ async fn run_turn(
             stop
         }
         Err(hint) => {
+            let hint = format!("[nail-agent setup] {hint} See https://github.com/qkun-zh/nail-agent#model-key-setup for setup steps.");
             if stream_text(&cx, &session_id, &mut cancel, &hint).await {
                 StopReason::EndTurn
             } else {
@@ -451,7 +472,14 @@ fn message_text(
 }
 
 /// Upper bound on model→tool→model rounds per prompt turn.
-const MAX_TOOL_TURNS: usize = 8;
+/// Override with `NAIL_MAX_TOOL_TURNS`.
+fn max_tool_turns() -> usize {
+    std::env::var("NAIL_MAX_TOOL_TURNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
 
 /// Run model turns until the answer is final: each round streams text (also
 /// buffered into the transcript), executes requested local tools, and feeds
@@ -478,7 +506,21 @@ async fn run_chat_loop(
     if let Some(servers) = sessions.mcp_servers_of(session_key)
         && !servers.is_empty()
     {
-        mcp_defs = pool.tools_for(session_key, &servers).await;
+        let (defs, skipped) = pool.tools_for(session_key, &servers).await;
+        mcp_defs = defs;
+        // Tell the user once per session: skipped servers look like
+        // "my tools are missing" otherwise (only a stderr warning exists).
+        if skipped > 0 && sessions.mark_mcp_warned(session_key) {
+            stream_text(
+                cx,
+                session_id,
+                cancel,
+                &format!(
+                    "[nail-agent notice] {skipped} MCP server(s) skipped: only stdio transport is supported."
+                ),
+            )
+            .await;
+        }
     }
     let has_octofs = mcp_defs
         .iter()
@@ -494,7 +536,7 @@ async fn run_chat_loop(
         ));
     }
     let mut turn_usage = crate::llm::Usage::default();
-    for _ in 0..MAX_TOOL_TURNS {
+    for _ in 0..max_tool_turns() {
         // Fresh owned captures per round: the callback moves them and the
         // stream loop keeps its own receiver clone, so nothing is borrowed
         // twice and the future stays `Send`.
@@ -537,6 +579,9 @@ async fn run_chat_loop(
             }
             TurnResult::Cancelled => return (StopReason::Cancelled, turn_usage),
             TurnResult::Error(detail) => {
+                // Errors stream as visible text (there is no ACP error card),
+                // so mark them unmistakably: they must never read as an answer.
+                let detail = format!("[nail-agent error] {detail}");
                 return if stream_text(cx, session_id, cancel, &detail).await {
                     (StopReason::EndTurn, turn_usage)
                 } else {
@@ -598,7 +643,7 @@ async fn run_chat_loop(
             }
         }
     }
-    if stream_text(cx, session_id, cancel, "（工具调用轮数已达上限，本轮结束）").await {
+    if stream_text(cx, session_id, cancel, "(tool-call round limit reached; ending this turn)").await {
         (StopReason::EndTurn, turn_usage)
     } else {
         (StopReason::Cancelled, turn_usage)

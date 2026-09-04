@@ -41,30 +41,93 @@ pub struct ModelMode {
     pub context_window: u64,
 }
 
-/// All models this agent can switch between. Only lists models verified
-/// against the workspace endpoint.
+/// All models this agent can switch between.
+///
+/// Default: models verified against the bundled workspace endpoint.
+/// Override with `NAIL_MODELS`, a comma-separated list of
+/// `id|display name|description|context_window`, e.g.
+/// `gpt-4o|GPT-4o|Default|128000,gpt-4o-mini|GPT-4o mini|Cheap|128000`.
+/// Malformed entries are skipped; when nothing parses, the built-in list
+/// below applies.
 pub fn available_modes() -> Vec<ModelMode> {
+    if let Ok(raw) = std::env::var("NAIL_MODELS")
+        && !raw.trim().is_empty()
+    {
+        let parsed: Vec<ModelMode> = raw
+            .split(',')
+            .filter_map(|entry| {
+                let mut parts = entry.split('|');
+                let id = parts.next()?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                // Leaked statics are acceptable here: parsed once per call,
+                // tiny, and this keeps `ModelMode` borrow-free for callers.
+                let id: &'static str = Box::leak(id.to_string().into_boxed_str());
+                let name: &'static str = Box::leak(
+                    parts
+                        .next()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| id.to_string())
+                        .into_boxed_str(),
+                );
+                let description: &'static str = Box::leak(
+                    parts
+                        .next()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| id.to_string())
+                        .into_boxed_str(),
+                );
+                let context_window = parts
+                    .next()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1_000_000);
+                Some(ModelMode {
+                    id,
+                    name,
+                    description,
+                    context_window,
+                })
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+        tracing::warn!("NAIL_MODELS did not parse, falling back to built-in modes");
+    }
     vec![
         ModelMode {
             id: "qwen3.7-flash",
             name: "Qwen3.7 Flash",
-            description: "默认，最便宜",
+            description: "Default, cheapest",
             context_window: 1_000_000,
         },
         ModelMode {
             id: "deepseek-v4-flash",
             name: "DeepSeek V4 Flash",
-            description: "便宜备选",
+            description: "Cheap alternative",
             context_window: 1_000_000,
         },
         ModelMode {
             id: "qwen3-coder-flash",
             name: "Qwen Coder Flash",
-            description: "代码特化",
+            description: "Code-specialized",
             // Estimate (same family as Qwen3 Coder Next, 262144); correct on evidence.
             context_window: 262_144,
         },
     ]
+}
+
+/// Default model: `NAIL_MODEL` wins, else the first advertised mode.
+pub fn default_model() -> &'static str {
+    if let Ok(model) = std::env::var("NAIL_MODEL")
+        && !model.trim().is_empty()
+    {
+        return Box::leak(model.trim().to_string().into_boxed_str());
+    }
+    available_modes().into_iter().next().map(|m| m.id).unwrap_or(DEFAULT_MODEL)
 }
 
 /// Context window for a model id; unknown models get a safe 1M default.
@@ -107,10 +170,10 @@ impl LlmConfig {
                 model: std::env::var("NAIL_MODEL")
                     .ok()
                     .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                    .unwrap_or_else(|| default_model().to_string()),
             }),
             None => Err(format!(
-                "没有找到 API Key：设置环境变量 NAIL_API_KEY，或把 key 写入 {}（chmod 600）",
+                "No API key found: set NAIL_API_KEY, or write the key to {} (chmod 600). Point NAIL_BASE_URL at your OpenAI-compatible endpoint when it is not the default.",
                 nail_key_file().display()
             )),
         }
@@ -126,9 +189,20 @@ impl LlmConfig {
 }
 
 fn home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var)
+            && !home.trim().is_empty()
+        {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA")
+        && !appdata.trim().is_empty()
+    {
+        return std::path::PathBuf::from(appdata);
+    }
+    std::path::PathBuf::from("/tmp")
 }
 
 fn nail_key_file() -> std::path::PathBuf {
@@ -225,6 +299,23 @@ struct StreamUsage {
     completion_tokens: u64,
 }
 
+/// Append an actionable hint to authentication-shaped failures: a 401/403
+/// almost always means the key does not belong to the configured endpoint
+/// (e.g. a workspace key with the default URL overridden, or vice versa).
+fn with_auth_hint(err: impl std::fmt::Display) -> String {
+    let text = err.to_string();
+    if text.contains("401") || text.contains("403") || text.contains("AccessDenied") || text.contains("Unauthorized") {
+        format!(
+            "{text} [hint: verify NAIL_API_KEY matches NAIL_BASE_URL — keys are only valid on their own endpoint]"
+        )
+    } else if text.contains("429") || text.contains("Rate limit") || text.contains("rate_limit") || text.contains("Queue full") {
+        format!(
+            "{text} [hint: provider rate limit hit — retry, lower concurrency, or use an authenticated endpoint]"
+        )
+    } else {
+        text
+    }
+}
 #[derive(Clone)]
 pub struct Llm {
     client: OpenAIClient<OpenAIConfig>,
@@ -282,7 +373,7 @@ impl Llm {
         }
         let request = match args.build() {
             Ok(request) => request,
-            Err(err) => return TurnResult::Error(format!("构造模型请求失败：{err}")),
+            Err(err) => return TurnResult::Error(format!("failed to build model request: {err}")),
         };
         let mut stream = match self
             .client
@@ -294,7 +385,7 @@ impl Llm {
             .await
         {
             Ok(stream) => stream,
-            Err(err) => return TurnResult::Error(format!("请求模型失败：{err}")),
+            Err(err) => return TurnResult::Error(with_auth_hint(format!("model request failed: {err}"))),
         };
 
         // Tool deltas accumulate by index: id/name arrive first, argument
@@ -311,7 +402,7 @@ impl Llm {
                     let Some(chunk) = chunk else { break };
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
-                        Err(err) => return TurnResult::Error(format!("读取流失败：{err}")),
+                        Err(err) => return TurnResult::Error(format!("failed reading stream: {err}")),
                     };
                     if let Some(report) = chunk.usage {
                         usage.input += report.prompt_tokens;

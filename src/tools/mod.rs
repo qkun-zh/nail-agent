@@ -96,6 +96,7 @@ pub(crate) fn announce_tool_call(
         session_id.clone(),
         SessionUpdate::ToolCall(
             ToolCall::new(tool_call_id.to_string(), title)
+                .status(ToolCallStatus::Pending)
                 .kind(tool_kind(tool))
                 .raw_input(raw_input),
         ),
@@ -126,7 +127,7 @@ fn clip(text: &str, limit: usize) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…（截断，只显示前 {limit} 字节）", &text[..end])
+    format!("{}...(truncated, showing first {limit} bytes)", &text[..end])
 }
 
 /// Completion update carrying what Zed renders: inline content blocks,
@@ -183,7 +184,9 @@ pub async fn ensure_permission(
         ctx.session_id.clone(),
         ToolCallUpdate::new(
             tool_call_id.to_string(),
-            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+            ToolCallUpdateFields::new()
+                .title(title.to_string())
+                .status(ToolCallStatus::InProgress),
         ),
         options,
     );
@@ -258,7 +261,7 @@ fn resolve(cwd: &std::path::Path, path: &str) -> std::path::PathBuf {
 /// Notably the agent's own key file can never pass through these tools.
 fn check_path(cwd: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
     if path.trim().is_empty() {
-        return Err("路径为空".to_string());
+        return Err("empty path".to_string());
     }
     let target = resolve(cwd, path);
     let base = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -267,17 +270,20 @@ fn check_path(cwd: &std::path::Path, path: &str) -> Result<std::path::PathBuf, S
         .unwrap_or_else(|_| lexical_clean(&target));
     if !probe.starts_with(&base) {
         return Err(format!(
-            "拒绝：{} 超出会话目录 {}",
+            "denied: {} is outside the session directory {}",
             target.display(),
             base.display()
         ));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok();
+    if let Some(home) = home {
         for guarded in [".ssh", ".gnupg", ".config/nail-agent", ".config/zacp", ".aws"] {
             let dir = home.join(guarded);
             if probe.starts_with(&dir) {
-                return Err(format!("拒绝：敏感路径 {}", dir.display()));
+                return Err(format!("denied: sensitive path {}", dir.display()));
             }
         }
     }
@@ -304,10 +310,11 @@ fn screen_command(command: &str) -> Option<String> {
     BLOCKED
         .iter()
         .find(|rule| flat.contains(*rule))
-        .map(|rule| format!("拒绝：命令命中危险模式 `{rule}`"))
+        .map(|rule| format!("denied: command matches dangerous pattern `{rule}`"))
 }
 
 /// Append-only audit trail of tool decisions and executions (best effort).
+/// Rotated at ~1 MiB (`audit.log.1`) so long-running use never fills disk.
 fn audit(session_key: &str, tool: &str, detail: &str, decision: &str) {
     let line = serde_json::json!({
         "ts": std::time::SystemTime::now()
@@ -323,6 +330,11 @@ fn audit(session_key: &str, tool: &str, detail: &str, decision: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Rotate before appending: keeps the audit trail bounded.
+    const MAX_AUDIT_BYTES: u64 = 1024 * 1024;
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_AUDIT_BYTES {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
     use std::fmt::Write;
     let mut buf = serde_json::to_string(&line).unwrap_or_default();
     let _ = writeln!(buf);
@@ -337,6 +349,7 @@ fn audit(session_key: &str, tool: &str, detail: &str, decision: &str) {
 /// Execute a shell command in `cwd`, killing the child on cancellation.
 /// Returns the combined output report and whether it was cancelled.
 pub async fn exec_shell(
+    sessions: &Sessions,
     session_key: &str,
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
@@ -356,7 +369,7 @@ pub async fn exec_shell(
         .output_byte_limit(64 * 1024);
     let terminal_id = match cx.send_request(create).block_task().await {
         Ok(response) => response.terminal_id,
-        Err(err) => return (format!("创建终端失败：{err}"), false, None),
+        Err(err) => return (format!("failed to create terminal: {err}"), false, None),
     };
     let mut cancel_wait = cancel.clone();
     let exited = tokio::select! {
@@ -378,7 +391,7 @@ pub async fn exec_shell(
                 ))
                 .block_task()
                 .await;
-            return (format!("等待终端退出失败：{err}"), false, None);
+            return (format!("failed waiting for terminal exit: {err}"), false, None);
         }
         None => {
             let _ = cx
@@ -395,7 +408,7 @@ pub async fn exec_shell(
                 ))
                 .block_task()
                 .await;
-            return ("命令被取消。".to_string(), true, None);
+            return ("Command was cancelled.".to_string(), true, None);
         }
     };
     let output = match cx
@@ -409,19 +422,16 @@ pub async fn exec_shell(
         Ok(response) => {
             let mut text = response.output;
             if response.truncated {
-                text.push_str("\n…（终端输出截断）");
+                text.push_str("\n...(terminal output truncated)");
             }
             text
         }
-        Err(err) => format!("\n[读取终端输出失败：{err}]"),
+        Err(err) => format!("\n[failed reading terminal output: {err}]"),
     };
-    let _ = cx
-        .send_request(ReleaseTerminalRequest::new(
-            session_id.clone(),
-            terminal_id.clone(),
-        ))
-        .block_task()
-        .await;
+    // NOTE: success path intentionally keeps the terminal alive (no release):
+    // the ToolCall card embeds Terminal(terminal_id) by reference, releasing
+    // here would make the card flicker/disappear in Zed. Terminals are
+    // reclaimed on session close / cancel via ReleaseTerminal there.
     // Always report exit code and wall time: this is the execution
     // detail the client card shows under the result.
     let mut text = output;
@@ -432,6 +442,7 @@ pub async fn exec_shell(
             .unwrap_or_else(|| "signal".to_string()),
         started.elapsed().as_secs_f32()
     ));
+    sessions.note_terminal(session_key, terminal_id.clone());
     (text, was_cancelled, Some(terminal_id))
 }
 
@@ -465,14 +476,14 @@ pub async fn exec_read(
                     end -= 1;
                 }
                 format!(
-                    "{}…（截断，只显示前 {LIMIT} 字节）",
+                    "{}...(truncated, showing first {LIMIT} bytes)",
                     &response.content[..end]
                 )
             } else {
                 response.content
             }
         }
-        Err(err) => format!("读取失败：{err}"),
+        Err(err) => format!("read failed: {err}"),
     }
 }
 
@@ -510,10 +521,10 @@ pub async fn exec_write(
         .await
     {
         Ok(_) => (
-            format!("已写入 {}（{} 字节）", target.display(), content.len()),
+            format!("wrote {} ({} bytes)", target.display(), content.len()),
             old_text,
         ),
-        Err(err) => (format!("写入失败：{err}"), old_text),
+        Err(err) => (format!("write failed: {err}"), old_text),
     }
 }
 
@@ -533,6 +544,11 @@ pub(crate) struct CallCtx<'a> {
 
 static TOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(crate) fn next_tool_seq() -> u64 {
+    use std::sync::atomic::Ordering;
+    TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Run one model-requested local tool: permission first, then execute.
 /// Every path reports ACP status updates under a single tool-call id.
 pub async fn execute_local(
@@ -540,24 +556,19 @@ pub async fn execute_local(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
-    use std::sync::atomic::Ordering;
     let done = |output: String| ToolOutcome { output, cancelled: false };
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(args) => args,
-        Err(_) => return done(format!("工具参数不是合法 JSON（{name}）：{arguments}")),
+        Err(_) => return done(format!("tool arguments are not valid JSON ({name}): {arguments}")),
     };
     let get = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let (tool, title) = match name {
         "run" => (TOOL_RUN, format!("run: {}", get("command"))),
         "read" => (TOOL_READ, format!("read {}", get("path"))),
         "write" => (TOOL_WRITE, format!("write {}", get("path"))),
-        other => return done(format!("未知工具：{other}（可用：run、read、write）")),
+        other => return done(format!("unknown tool: {other} (available: run, read, write)")),
     };
-    let tool_id = format!(
-        "{}-{}",
-        tool,
-        TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let tool_id = format!("{}-{}", tool, next_tool_seq());
     if !ensure_permission(ctx, &tool_id,
         tool,
         &title,
@@ -571,7 +582,7 @@ pub async fn execute_local(
             &title,
             ToolCallStatus::Failed,
         ));
-        return done("用户拒绝了这次工具调用。".to_string());
+        return done("The user rejected this tool call.".to_string());
     }
     let _ = ctx.cx.send_notification(tool_update(
         ctx.session_id,
@@ -587,6 +598,7 @@ pub async fn execute_local(
     let (output, content, locations, raw_output) = match tool {
         TOOL_RUN => {
             let (report, was_cancelled, terminal_id) = exec_shell(
+                ctx.sessions,
                 ctx.session_key,
                 ctx.cx,
                 ctx.session_id,
