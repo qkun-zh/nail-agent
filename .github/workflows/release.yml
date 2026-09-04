@@ -1,0 +1,106 @@
+# Release: per-platform archives bundling nail-agent + pinned octofs.
+# Triggered by tags like v0.1.0. octofs is downloaded (not built):
+# https://github.com/Muvon/octofs releases, pinned below for reproducibility.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  OCTOFS_VERSION: "0.15.2"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            plat: linux-x86_64
+            octofs_asset: octofs-0.15.2-x86_64-unknown-linux-musl.tar.gz
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            plat: linux-aarch64
+            octofs_asset: octofs-0.15.2-aarch64-unknown-linux-musl.tar.gz
+            archive_ext: tar.gz
+          - os: macos-14
+            rust_target: aarch64-apple-darwin
+            plat: darwin-aarch64
+            octofs_asset: octofs-0.15.2-aarch64-apple-darwin.tar.gz
+            archive_ext: tar.gz
+          - os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            plat: darwin-x86_64
+            octofs_asset: octofs-0.15.2-x86_64-apple-darwin.tar.gz
+            archive_ext: tar.gz
+          - os: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+            plat: windows-x86_64
+            octofs_asset: octofs-0.15.2-x86_64-pc-windows-msvc.zip
+            archive_ext: zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build nail-agent
+        run: cargo build --release --target ${{ matrix.rust_target }}
+        # No cmake/CC needed: native-tls via system OpenSSL on Linux,
+        # schannel/Security-framework elsewhere; ring/aws-lc unused.
+
+      - name: Fetch pinned octofs
+        shell: bash
+        run: |
+          curl -sSL -o octofs-pkg \
+            "https://github.com/Muvon/octofs/releases/download/${OCTOFS_VERSION}/${{ matrix.octofs_asset }}"
+          mkdir octofs-out
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            unzip -q octofs-pkg -d octofs-out
+          else
+            tar xzf octofs-pkg -C octofs-out
+          fi
+          find octofs-out -type f | head -n 10
+
+      - name: Bundle archive (unix)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p stage
+          cp "target/${{ matrix.rust_target }}/release/nail-agent" stage/
+          O=$(find octofs-out -type f -name "octofs" | head -n 1)
+          cp "$O" stage/
+          ls -la stage/
+          tar czf "nail-agent-${{ github.ref_name }}-${{ matrix.plat }}.tar.gz" -C stage .
+
+      - name: Bundle archive (windows)
+        if: matrix.archive_ext == 'zip'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item "target/${{ matrix.rust_target }}/release/nail-agent.exe" stage/
+          $o = (Get-ChildItem -Recurse -Filter "octofs.exe" octofs-out | Select-Object -First 1).FullName
+          Copy-Item $o stage/
+          Get-ChildItem stage/
+          Compress-Archive -Path stage/* -DestinationPath "nail-agent-${{ github.ref_name }}-${{ matrix.plat }}.zip"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          (sha256sum nail-agent-* 2>/dev/null || shasum -a 256 nail-agent-*) > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nail-agent-*
+            SHA256SUMS

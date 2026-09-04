@@ -45,9 +45,11 @@ prompt. Threads reopen from history via `session/resume`.
 - streamed replies with per-turn token usage (`usage_update`) and visible
   thinking (`agent_thought_chunk`, via `byot` chunk types)
 - **octofs embedded**: the [octofs](https://github.com/muvon/octofs) MCP filesystem
-  server auto-attaches per session (`--path <cwd>`) when its binary is found
-  (`OCTOFS_BIN` env or `PATH`); its tools (`octofs__view`, `octofs__shell`, …)
-  shadow the overlapping built-ins so the model sees one toolbox.
+  server auto-attaches per session (`--path <cwd>`) when its binary is found —
+  lookup order: `OCTOFS_BIN` env, then next to the agent executable itself
+  (release archives ship both binaries together), then `PATH`.
+  Its tools (`octofs__view`, `octofs__shell`, …) shadow the overlapping
+  built-ins so the model sees one toolbox.
   Without it, the three built-in tools cover run/read/write.
 - permission-gated tools (allow-once/always/reject) with rich reports:
   inline content, file locations, raw I/O, and real diffs for writes
