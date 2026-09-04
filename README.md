@@ -1,0 +1,58 @@
+# nail-agent — registry-grade ACP agent for Zed
+
+Speaks [Agent Client Protocol v1](https://agentclientprotocol.com) over stdio.
+Plain prompts are answered by a real model (streamed); the model gets local
+tools (`run` / `read` / `write`) plus Zed-forwarded MCP servers through
+standard function calling. Sessions persist in AgDb and survive restarts.
+
+## Build & test
+
+```sh
+cargo build
+cargo test   # unit + stdio e2e (some tests call the live model)
+cargo clippy --all-targets  # zero warnings required
+```
+
+## Model key setup
+
+Reads, in order: `NAIL_API_KEY` env → `~/.config/nail-agent/api_key` (`chmod 600`).
+Optional: `NAIL_BASE_URL` (default: the project's DashScope workspace),
+`NAIL_MODEL` (default: `qwen3.7-flash`), `NAIL_DATA_DIR` (data redirect),
+`NAIL_KEY_FILE` (key file redirect).
+
+## Use from Zed
+
+```jsonc
+{ "agent_servers": { "nail-agent": {
+  "type": "custom",
+  "command": "/path/to/nail-agent/target/release/nail-agent",
+  "args": [], "env": {}
+} } }
+```
+
+For a WSL project opened from Windows Zed, point `command` at the Linux
+binary path (threads spawn inside the distro — no `wsl` wrapper).
+
+Then: ask anything, switch models in the mode picker (Qwen3.7 Flash,
+DeepSeek V4 Flash, Qwen Coder Flash), approve tool calls in the permission
+prompt. Threads reopen from history via `session/resume`.
+
+## What's implemented
+
+- initialize (+ `agent`-type `api-key` auth method), session/new/load-guard,
+  prompt (spawned turns), cancel (interrupts streams, kills children),
+  close, resume (AgDb-backed), set_mode, authenticate
+- streamed replies, permission-gated tools (allow-once/always/reject),
+  per-session cwd, per-session MCP stdio servers, audit log
+- safety: cwd confinement, sensitive-path refusal, destructive-command
+  screen — but **not a sandbox**: the process runs as your user, the
+  permission dialog is the real gate
+
+## Layout
+
+- `main.rs` — bootstrap (tracing to stderr)
+- `proto.rs` — ACP handlers + turn loop
+- `core.rs` — session registry and lifecycle
+- `llm.rs` — model backends, modes, streaming
+- `tools/` — local toolbox + permission + safety (`mcp.rs`: stdio client)
+- `store.rs` — AgDb session persistence
