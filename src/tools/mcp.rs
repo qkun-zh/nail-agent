@@ -185,8 +185,11 @@ pub struct McpPool {
 /// Name of the embedded filesystem server.
 pub const OCTOFS_SERVER: &str = "octofs";
 
-/// Locate the octofs binary: `OCTOFS_BIN` wins, otherwise search `PATH`.
-/// Returns `None` when absent — the caller falls back to built-in tools.
+/// Locate the octofs binary.
+///
+/// Order: `OCTOFS_BIN` env → next to the agent executable itself (release
+/// archives ship both binaries together) → `PATH`. Returns `None` when
+/// absent — the caller falls back to built-in tools.
 pub fn octofs_command() -> Option<std::path::PathBuf> {
     if let Ok(bin) = std::env::var("OCTOFS_BIN")
         && !bin.is_empty()
@@ -194,6 +197,17 @@ pub fn octofs_command() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(bin);
         if path.is_file() {
             return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        #[cfg(windows)]
+        let sibling = dir.join("octofs.exe");
+        #[cfg(not(windows))]
+        let sibling = dir.join("octofs");
+        if sibling.is_file() {
+            return Some(sibling);
         }
     }
     find_on_path("octofs", &std::env::var("PATH").unwrap_or_default())

@@ -44,6 +44,11 @@ prompt. Threads reopen from history via `session/resume`.
   close, resume + load (AgDb-backed, history replay), set_mode, authenticate
 - streamed replies with per-turn token usage (`usage_update`) and visible
   thinking (`agent_thought_chunk`, via `byot` chunk types)
+- **octofs embedded**: the [octofs](https://github.com/muvon/octofs) MCP filesystem
+  server auto-attaches per session (`--path <cwd>`) when its binary is found
+  (`OCTOFS_BIN` env or `PATH`); its tools (`octofs__view`, `octofs__shell`, …)
+  shadow the overlapping built-ins so the model sees one toolbox.
+  Without it, the three built-in tools cover run/read/write.
 - permission-gated tools (allow-once/always/reject) with rich reports:
   inline content, file locations, raw I/O, and real diffs for writes
 - safety: cwd confinement, sensitive-path refusal, destructive-command
