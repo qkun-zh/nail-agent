@@ -142,17 +142,35 @@ pub struct PendingToolCall {
 }
 
 /// Outcome of a single model turn (no looping here; the caller loops).
-#[derive(Debug)]
+/// Token usage accumulated from one streaming turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+}
+
+impl Usage {
+    pub fn total(self) -> u64 {
+        self.input + self.output
+    }
+
+    pub fn add(&mut self, other: Usage) {
+        self.input += other.input;
+        self.output += other.output;
+    }
+}
+
 pub enum TurnResult {
     /// Plain answer streamed out, nothing else requested.
-    TextDone,
+    TextDone {
+        usage: Usage,
+    },
     /// The model wants these tools run; results must be appended as
     /// `tool` messages and the conversation continued.
     ToolCalls {
-        /// Phase 3 (tools layer) appends this to the transcript.
-        #[allow(dead_code)]
         assistant: ChatCompletionRequestMessage,
         calls: Vec<PendingToolCall>,
+        usage: Usage,
     },
     Cancelled,
     Error(String),
@@ -202,7 +220,12 @@ impl Llm {
         mut on_text: impl AsyncFnMut(&str) -> bool,
     ) -> TurnResult {
         let mut args = CreateChatCompletionRequestArgs::default();
-        args.model(model).messages(messages).stream(true);
+        args.model(model).messages(messages).stream(true).stream_options(
+            async_openai::types::chat::ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            },
+        );
         if !tools.is_empty() {
             args.tools(tools);
         }
@@ -221,6 +244,7 @@ impl Llm {
         let mut tool_names: Vec<String> = Vec::new();
         let mut tool_args: Vec<String> = Vec::new();
         let mut full_content = String::new();
+        let mut usage = Usage::default();
 
         loop {
             tokio::select! {
@@ -230,6 +254,10 @@ impl Llm {
                         Ok(chunk) => chunk,
                         Err(err) => return TurnResult::Error(format!("读取流失败：{err}")),
                     };
+                    if let Some(report) = chunk.usage {
+                        usage.input += u64::from(report.prompt_tokens);
+                        usage.output += u64::from(report.completion_tokens);
+                    }
                     for choice in chunk.choices {
                         if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
                             full_content.push_str(&text);
@@ -275,7 +303,7 @@ impl Llm {
             }
         }
         if calls.is_empty() {
-            TurnResult::TextDone
+            TurnResult::TextDone { usage }
         } else {
             let content = if full_content.is_empty() {
                 None
@@ -306,7 +334,7 @@ impl Llm {
                     ..Default::default()
                 },
             );
-            TurnResult::ToolCalls { assistant, calls }
+            TurnResult::ToolCalls { assistant, calls, usage }
         }
     }
 

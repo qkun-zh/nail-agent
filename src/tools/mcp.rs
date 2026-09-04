@@ -341,11 +341,10 @@ pub async fn execute_mcp(
     namespaced: &str,
     arguments: &str,
 ) -> McpToolOutcome {
-    use super::{ensure_permission, tool_update};
-    use agent_client_protocol::schema::v1::ToolCallStatus;
+    use super::{clip, ensure_permission, tool_result_update, tool_update};
+    use agent_client_protocol::schema::v1::{ToolCallContent, ToolCallStatus};
 
     let done = |output: String| McpToolOutcome { output, cancelled: false };
-    let cancel: &mut tokio::sync::watch::Receiver<bool> = &mut *ctx.cancel;
     let Some((server, tool)) = McpPool::split_namespaced(namespaced) else {
         return done(format!("未知工具：{namespaced}"));
     };
@@ -355,14 +354,10 @@ pub async fn execute_mcp(
     };
     let tool_id = format!("mcp-{namespaced}");
     let title = format!("{server}: {tool}");
-    if !ensure_permission(
-        ctx.sessions,
-        ctx.cx,
-        ctx.session_id,
-        ctx.session_key,
-        &tool_id,
+    if !ensure_permission(ctx, &tool_id,
         namespaced,
         &title,
+        Some(args.clone()),
     )
     .await
     {
@@ -380,15 +375,19 @@ pub async fn execute_mcp(
         &title,
         ToolCallStatus::InProgress,
     ));
+    let cancel: &mut tokio::sync::watch::Receiver<bool> = &mut *ctx.cancel;
     let output = tokio::select! {
         result = pool.call(ctx.session_key, server, tool, args) => {
             match result {
                 Ok(output) => {
-                    let _ = ctx.cx.send_notification(tool_update(
+                    let _ = ctx.cx.send_notification(tool_result_update(
                         ctx.session_id,
                         &tool_id,
                         &title,
                         ToolCallStatus::Completed,
+                        vec![ToolCallContent::from(clip(&output, 2000))],
+                        Vec::new(),
+                        Some(serde_json::Value::String(clip(&output, 4000))),
                     ));
                     output
                 }

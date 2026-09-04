@@ -56,6 +56,9 @@ pub struct Session {
     pub mcp_servers: Vec<McpServer>,
     /// Tool names the user approved with "allow always" in this session.
     pub always_allowed: HashSet<String>,
+    /// Cumulative token usage reported by the model endpoint.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub turn_count: u32,
     pub last_activity_at: u64,
     /// Set to `true` by the `session/cancel` handler; the running turn
@@ -104,6 +107,8 @@ impl Sessions {
                 mode: DEFAULT_MODEL.to_string(),
                 transcript: Vec::new(),
                 mcp_servers,
+                input_tokens: 0,
+                output_tokens: 0,
                 always_allowed: HashSet::new(),
                 turn_count: 0,
                 last_activity_at: now,
@@ -186,6 +191,20 @@ impl Sessions {
             .unwrap_or(false)
     }
 
+    /// Add reported token usage. Returns the session totals.
+    pub fn add_usage(&self, id: &str, usage: crate::llm::Usage) -> crate::llm::Usage {
+        if let Some(session) = self.lock().get_mut(id) {
+            session.input_tokens += usage.input;
+            session.output_tokens += usage.output;
+            crate::llm::Usage {
+                input: session.input_tokens,
+                output: session.output_tokens,
+            }
+        } else {
+            usage
+        }
+    }
+
     /// Replace the transcript (capped) and persist the session.
     pub fn save_transcript(&self, id: &str, mut transcript: Vec<ChatCompletionRequestMessage>) {
         if transcript.len() > MAX_TRANSCRIPT {
@@ -234,6 +253,8 @@ impl Sessions {
                 transcript: stored.transcript,
                 // Fresh server list arrives with the resume request.
                 mcp_servers: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
                 always_allowed: HashSet::new(),
                 turn_count: 0,
                 last_activity_at: now,

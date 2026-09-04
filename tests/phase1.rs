@@ -250,6 +250,24 @@ async fn phase1_model_calls_tool_by_itself() {
             == Some(&json!("tool_call"))),
         "expected a tool_call update"
     );
+    // Zed renders these: the completion update carries inline content…
+    assert!(
+        notifs.iter().any(|n| {
+            let update = &n["params"]["update"];
+            update.get("sessionUpdate") == Some(&json!("tool_call_update"))
+                && update.get("content").is_some()
+        }),
+        "expected a tool_call_update with content"
+    );
+    // …and the turn reports token usage.
+    assert!(
+        notifs.iter().any(|n| {
+            let update = &n["params"]["update"];
+            update.get("sessionUpdate") == Some(&json!("usage_update"))
+                && update.get("used").and_then(|u| u.as_u64()).unwrap_or(0) > 0
+        }),
+        "expected a usage_update with used > 0"
+    );
     assert!(Peer::agent_text(&notifs).contains("final-tool-ok"));
 }
 
@@ -379,4 +397,54 @@ async fn phase1_load_replays_history() {
         .await;
     let frame = peer.next_frame().await;
     assert!(frame.get("error").is_some(), "expected error, got {frame}");
+}
+
+#[tokio::test]
+async fn phase1_write_reports_diff() {
+    let _live = LIVE.lock().await;
+    let mut peer = Peer::spawn().await;
+    let session = new_session(&mut peer).await;
+
+    let id = peer.next_id;
+    peer.next_id += 1;
+    peer.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+        "params":{"sessionId": session, "prompt": [{
+            "type": "text",
+            "text": "Write exactly `write-diff-ok` to /tmp/nail-write-probe.txt using the write tool, then reply with done and nothing else."
+        }]}}))
+        .await;
+    let mut notifs = Vec::new();
+    let stop = loop {
+        let frame = peer.next_frame().await;
+        if frame.get("id") == Some(&json!(id)) {
+            assert!(frame.get("error").is_none(), "prompt failed: {}", frame["error"]);
+            break frame["result"]["stopReason"].clone();
+        }
+        if frame.get("method") == Some(&json!("session/request_permission")) {
+            let req_id = frame["id"].clone();
+            peer.send(&json!({"jsonrpc":"2.0","id":req_id,
+                "result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}))
+                .await;
+            continue;
+        }
+        notifs.push(frame);
+    };
+    assert_eq!(stop, json!("end_turn"));
+    // The completion update embeds a real diff for Zed to render
+    // (ToolCallContent is internally tagged: {"type": "diff", ...}).
+    assert!(
+        notifs.iter().any(|n| {
+            let update = &n["params"]["update"];
+            update.get("sessionUpdate") == Some(&json!("tool_call_update"))
+                && update.get("content").and_then(|c| c.as_array()).map(|items| {
+                    items.iter().any(|i| {
+                        i.get("type") == Some(&json!("diff"))
+                            && i.get("newText").and_then(|t| t.as_str())
+                                == Some("write-diff-ok")
+                    })
+                }).unwrap_or(false)
+        }),
+        "expected a tool_call_update with diff"
+    );
+    assert!(Peer::agent_text(&notifs).contains("done"));
 }

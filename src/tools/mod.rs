@@ -16,9 +16,10 @@
 pub mod mcp;
 
 use agent_client_protocol::schema::v1::{
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionId, SessionNotification, SessionUpdate, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Diff, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use async_openai::types::chat::ChatCompletionTools;
 use serde_json::json;
@@ -85,11 +86,14 @@ pub(crate) fn announce_tool_call(
     tool_call_id: &str,
     title: &str,
     tool: &str,
+    raw_input: Option<serde_json::Value>,
 ) {
     let _ = cx.send_notification(SessionNotification::new(
         session_id.clone(),
         SessionUpdate::ToolCall(
-            ToolCall::new(tool_call_id.to_string(), title).kind(tool_kind(tool)),
+            ToolCall::new(tool_call_id.to_string(), title)
+                .kind(tool_kind(tool))
+                .raw_input(raw_input),
         ),
     ));
 }
@@ -109,21 +113,57 @@ pub(crate) fn tool_update(
     )
 }
 
+/// Truncate display text with a marker instead of silent cutting.
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…（截断，只显示前 {limit} 字节）", &text[..end])
+}
+
+/// Completion update carrying what Zed renders: inline content blocks,
+/// file locations, and the raw output payload.
+#[allow(clippy::too_many_arguments)]
+fn tool_result_update(
+    session_id: &SessionId,
+    tool_call_id: &str,
+    title: &str,
+    status: ToolCallStatus,
+    content: Vec<ToolCallContent>,
+    locations: Vec<ToolCallLocation>,
+    raw_output: Option<serde_json::Value>,
+) -> SessionNotification {
+    SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            ToolCallUpdateFields::new()
+                .title(title.to_string())
+                .status(status)
+                .content(content)
+                .locations(locations)
+                .raw_output(raw_output),
+        )),
+    )
+}
+
 /// Ask the client for permission unless this session remembered allow-always.
 /// `tool_call_id` identifies the whole create/update sequence.
 /// Returns `true` when the tool may run.
 pub async fn ensure_permission(
-    sessions: &Sessions,
-    cx: &ConnectionTo<Client>,
-    session_id: &SessionId,
-    session_key: &str,
+    ctx: &CallCtx<'_>,
     tool_call_id: &str,
     tool: &str,
     title: &str,
+    raw_input: Option<serde_json::Value>,
 ) -> bool {
-    announce_tool_call(cx, session_id, tool_call_id, title, tool);
-    if sessions.is_always_allowed(session_key, tool) {
-        audit(session_key, tool, title, "allow-always-remembered");
+    announce_tool_call(ctx.cx, ctx.session_id, tool_call_id, title, tool, raw_input);
+    if ctx.sessions.is_always_allowed(ctx.session_key, tool) {
+        audit(ctx.session_key, tool, title, "allow-always-remembered");
         return true;
     }
     let options = vec![
@@ -136,18 +176,18 @@ pub async fn ensure_permission(
         PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
     ];
     let request = RequestPermissionRequest::new(
-        session_id.clone(),
+        ctx.session_id.clone(),
         ToolCallUpdate::new(
             tool_call_id.to_string(),
             ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
         ),
         options,
     );
-    let response = match cx.send_request(request).block_task().await {
+    let response = match ctx.cx.send_request(request).block_task().await {
         Ok(response) => response,
         Err(err) => {
-            tracing::warn!(session = session_key, error = %err, "permission request failed");
-            audit(session_key, tool, title, "error");
+            tracing::warn!(session = ctx.session_key, error = %err, "permission request failed");
+            audit(ctx.session_key, tool, title, "error");
             return false;
         }
     };
@@ -155,18 +195,18 @@ pub async fn ensure_permission(
         RequestPermissionOutcome::Selected(selected) => {
             let id: &str = &selected.option_id.0;
             if id == "allow-always" {
-                sessions.remember_allow_always(session_key, tool);
+                ctx.sessions.remember_allow_always(ctx.session_key, tool);
             }
             let allowed = id == "allow-once" || id == "allow-always";
-            audit(session_key, tool, title, if allowed { id } else { "deny" });
+            audit(ctx.session_key, tool, title, if allowed { id } else { "deny" });
             allowed
         }
         RequestPermissionOutcome::Cancelled => {
-            audit(session_key, tool, title, "cancelled");
+            audit(ctx.session_key, tool, title, "cancelled");
             false
         }
         _ => {
-            audit(session_key, tool, title, "deny");
+            audit(ctx.session_key, tool, title, "deny");
             false
         }
     }
@@ -386,18 +426,22 @@ pub async fn exec_write(
     cwd: &std::path::Path,
     path: &str,
     content: &str,
-) -> String {
+) -> (String, Option<String>) {
     let target = match check_path(cwd, path) {
         Ok(target) => target,
         Err(reason) => {
             audit(session_key, TOOL_WRITE, path, "blocked");
-            return reason;
+            return (reason, None);
         }
     };
     audit(session_key, TOOL_WRITE, path, "exec");
+    let old_text = tokio::fs::read_to_string(&target).await.ok();
     match tokio::fs::write(&target, content).await {
-        Ok(()) => format!("已写入 {}（{} 字节）", target.display(), content.len()),
-        Err(err) => format!("写入失败：{err}"),
+        Ok(()) => (
+            format!("已写入 {}（{} 字节）", target.display(), content.len()),
+            old_text,
+        ),
+        Err(err) => (format!("写入失败：{err}"), old_text),
     }
 }
 
@@ -425,7 +469,6 @@ pub async fn execute_local(
     arguments: &str,
 ) -> ToolOutcome {
     use std::sync::atomic::Ordering;
-    let cancel: &mut watch::Receiver<bool> = &mut *ctx.cancel;
     let done = |output: String| ToolOutcome { output, cancelled: false };
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(args) => args,
@@ -443,7 +486,13 @@ pub async fn execute_local(
         tool,
         TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    if !ensure_permission(ctx.sessions, ctx.cx, ctx.session_id, ctx.session_key, &tool_id, tool, &title).await {
+    if !ensure_permission(ctx, &tool_id,
+        tool,
+        &title,
+        Some(args.clone()),
+    )
+    .await
+    {
         let _ = ctx.cx.send_notification(tool_update(
             ctx.session_id,
             &tool_id,
@@ -458,8 +507,12 @@ pub async fn execute_local(
         &title,
         ToolCallStatus::InProgress,
     ));
+    let cancel: &mut watch::Receiver<bool> = &mut *ctx.cancel;
     let cwd = session_cwd(ctx.sessions, ctx.session_key);
-    let output = match tool {
+    // Each tool reports rich results: inline content for Zed to render,
+    // file locations where applicable, and the raw output payload.
+    // `output` (fed back to the model) stays the full report.
+    let (output, content, locations, raw_output) = match tool {
         TOOL_RUN => {
             let (report, was_cancelled) =
                 exec_shell(ctx.session_key, get("command"), &cwd, cancel).await;
@@ -472,19 +525,55 @@ pub async fn execute_local(
                 ));
                 return ToolOutcome { output: report, cancelled: true };
             }
-            report
+            let content = vec![ToolCallContent::from(clip(&report, 2000))];
+            let raw = serde_json::Value::String(clip(&report, 4000));
+            (report, content, Vec::new(), Some(raw))
         }
-        TOOL_READ => exec_read(ctx.session_key, &cwd, get("path")).await,
-        TOOL_WRITE => exec_write(ctx.session_key, &cwd, get("path"), get("content")).await,
+        TOOL_READ => {
+            let report = exec_read(ctx.session_key, &cwd, get("path")).await;
+            let locations = resolve_location(&cwd, get("path"));
+            let content = vec![ToolCallContent::from(clip(&report, 2000))];
+            (report, content, locations, None)
+        }
+        TOOL_WRITE => {
+            let path = get("path");
+            let (report, old_text) =
+                exec_write(ctx.session_key, &cwd, path, get("content")).await;
+            let locations = resolve_location(&cwd, path);
+            let new_text = clip(get("content"), 2000);
+            let abs = locations
+                .first()
+                .map(|l| l.path.clone())
+                .unwrap_or_else(|| cwd.join(path));
+            let mut diff = Diff::new(abs, new_text);
+            if let Some(old) = old_text {
+                diff.old_text = Some(clip(&old, 2000));
+            }
+            let content = vec![ToolCallContent::Diff(diff)];
+            let raw = serde_json::Value::String(report.clone());
+            (report, content, locations, Some(raw))
+        }
         _ => unreachable!(),
     };
-    let _ = ctx.cx.send_notification(tool_update(
+    let _ = ctx.cx.send_notification(tool_result_update(
         ctx.session_id,
         &tool_id,
         &title,
         ToolCallStatus::Completed,
+        content,
+        locations,
+        raw_output,
     ));
     done(output)
+}
+
+/// Absolute location for a tool path, for Zed file links.
+/// Returns empty when the path was rejected (never leaks guarded paths).
+fn resolve_location(cwd: &std::path::Path, path: &str) -> Vec<ToolCallLocation> {
+    match check_path(cwd, path) {
+        Ok(target) => vec![ToolCallLocation::new(target)],
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]

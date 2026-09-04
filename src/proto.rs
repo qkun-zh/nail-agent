@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionMode,
     SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use tokio::sync::watch;
@@ -295,7 +295,19 @@ async fn run_turn(
     transcript.push(Llm::user(&text));
 
     let stop = match llm::LlmConfig::load().map(|c| llm::Llm::new(&c.with_model(&model))) {
-        Ok(llm) => run_chat_loop(&sessions, &pool, &cx, &session_id, &session_key, &mut cancel, &model, &llm, &mut transcript).await,
+        Ok(llm) => {
+            let (stop, usage) = run_chat_loop(&sessions, &pool, &cx, &session_id, &session_key, &mut cancel, &model, &llm, &mut transcript).await;
+            // Report cumulative session usage so the client can display cost.
+            // 1M context window is what all three session models offer.
+            let used = sessions.add_usage(&session_key, usage).total();
+            if used > 0 {
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::UsageUpdate(UsageUpdate::new(used, 1_000_000)),
+                ));
+            }
+            stop
+        }
         Err(hint) => {
             if stream_text(&cx, &session_id, &mut cancel, &hint).await {
                 StopReason::EndTurn
@@ -388,7 +400,7 @@ async fn run_chat_loop(
     model: &str,
     llm: &Llm,
     transcript: &mut Vec<async_openai::types::chat::ChatCompletionRequestMessage>,
-) -> StopReason {
+) -> (StopReason, crate::llm::Usage) {
     use crate::tools::local_tool_defs;
 
     let mut tools = local_tool_defs();
@@ -404,6 +416,7 @@ async fn run_chat_loop(
             ));
         }
     }
+    let mut turn_usage = crate::llm::Usage::default();
     for _ in 0..MAX_TOOL_TURNS {
         // Fresh owned captures per round: the callback moves them and the
         // stream loop keeps its own receiver clone, so nothing is borrowed
@@ -428,22 +441,24 @@ async fn run_chat_loop(
             )
             .await
         {
-            TurnResult::TextDone => {
+            TurnResult::TextDone { usage } => {
+                turn_usage.add(usage);
                 let full = reply_sink.lock().map(|r| r.clone()).unwrap_or_default();
                 if !full.is_empty() {
                     transcript.push(Llm::assistant(&full));
                 }
-                return StopReason::EndTurn;
+                return (StopReason::EndTurn, turn_usage);
             }
-            TurnResult::Cancelled => return StopReason::Cancelled,
+            TurnResult::Cancelled => return (StopReason::Cancelled, turn_usage),
             TurnResult::Error(detail) => {
                 return if stream_text(cx, session_id, cancel, &detail).await {
-                    StopReason::EndTurn
+                    (StopReason::EndTurn, turn_usage)
                 } else {
-                    StopReason::Cancelled
+                    (StopReason::Cancelled, turn_usage)
                 };
             }
-            TurnResult::ToolCalls { assistant, calls } => {
+            TurnResult::ToolCalls { assistant, calls, usage } => {
+                turn_usage.add(usage);
                 transcript.push(assistant);
                 let mut stopped = false;
                 for call in &calls {
@@ -479,15 +494,15 @@ async fn run_chat_loop(
                     transcript.push(Llm::tool_result(&call.id, output));
                 }
                 if stopped {
-                    return StopReason::Cancelled;
+                    return (StopReason::Cancelled, turn_usage);
                 }
             }
         }
     }
     if stream_text(cx, session_id, cancel, "（工具调用轮数已达上限，本轮结束）").await {
-        StopReason::EndTurn
+        (StopReason::EndTurn, turn_usage)
     } else {
-        StopReason::Cancelled
+        (StopReason::Cancelled, turn_usage)
     }
 }
 
