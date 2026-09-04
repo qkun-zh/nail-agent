@@ -43,5 +43,9 @@
         "env": {}
       }
     }
-  }
+  },
+  "website": "https://github.com/qkun-zh/nail-agent",
+  "authors": [
+    "qkun-zh"
+  ]
 }
